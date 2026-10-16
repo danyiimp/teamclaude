@@ -1693,7 +1693,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, holdKeepalive: /** @type {{ holdKeepalive?: unknown } | null | undefined} */ (config)?.holdKeepalive === true, keepalive: /** @type {{ res: import('node:http').ServerResponse, close: () => void }|null} */ (null), pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1734,6 +1734,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       } finally {
         res.off('close', onRequestClose);
+        // A held stream already has its 200 out, so the 502 above could not be
+        // sent: end it with an error event instead of leaving it open.
+        ctx.keepalive?.close();
         // The signal fires only for a departure (see above), so this is the
         // status of a row whose client will never read anything. It says
         // nothing about abandonment: that is still marked where it is observed.
@@ -1951,6 +1954,104 @@ function awaitRotatedToken(account, sent, reload) {
     rotatedTokenWaits.set(account, wait);
   }
   return wait;
+}
+
+// How often a held stream is pinged while it waits (see holdKeepalive).
+const HOLD_PING_MS = 15_000;
+const SSE_PING = 'event: ping\ndata: {"type": "ping"}\n\n';
+
+/**
+ * Answer a held streaming request now, and keep it alive until an account can
+ * serve it. Opt-in, with `holdKeepalive: true`.
+ *
+ * A hold is silent: nothing is written until an account recovers. Claude Code
+ * does not wait on silence for as long as a hold lasts. Apart from its request
+ * timeout (API_TIMEOUT_MS, which `teamclaude run` raises), it aborts a
+ * streaming request whose first byte is late, and one whose stream goes idle,
+ * and retries; once its retries run out the turn fails, and an unattended run
+ * dies inside the very hold that was meant to carry it.
+ *
+ * So the 200 and the event-stream headers go out at once, followed by
+ * `event: ping` every 15 seconds — the event the upstream itself sends to keep
+ * a stream open — while the hold goes on polling. Everything the request does
+ * after that writes into the returned `res`, which reports `headersSent: false`
+ * until the real answer begins, so every branch of forwardRequest runs exactly
+ * as it would have:
+ *
+ *   - a 2xx event stream passes straight through, minus its own headers, which
+ *     cannot be sent twice;
+ *   - any other answer — the exhausted 429 once the budget runs out, an
+ *     upstream error — is buffered and sent as one `event: error` carrying its
+ *     error object, the in-stream form of the same error.
+ *
+ * `close()` ends a response the request left open (a throw, say) with an
+ * `event: error`, and is safe to call on one that finished.
+ *
+ * @param {import('node:http').ServerResponse} res
+ * @returns {{ res: import('node:http').ServerResponse, close: () => void }}
+ */
+function holdKeepalive(res) {
+  res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' });
+  const ping = () => { if (!res.destroyed && !res.writableEnded) res.write(SSE_PING); };
+  ping();
+  const timer = setInterval(ping, HOLD_PING_MS);
+  const stop = () => clearInterval(timer);
+  res.once('close', stop);
+  /** @type {'pass'|'error'|null} null until the real answer begins */
+  let mode = null;
+  let status = 502;
+  /** @type {Buffer[]} */
+  const errorBody = [];
+  const toBuffer = (/** @type {unknown} */ chunk) => (Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  const sendError = () => {
+    let payload = null;
+    try { payload = JSON.parse(Buffer.concat(errorBody).toString('utf8')); } catch { /* replaced below */ }
+    if (payload?.type !== 'error') {
+      payload = { type: 'error', error: { type: status === 429 ? 'rate_limit_error' : 'api_error', message: `Upstream answered ${status}.` } };
+    }
+    if (!res.destroyed && !res.writableEnded) res.end(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
+  };
+  /** @type {import('node:http').ServerResponse} */
+  const held = new Proxy(res, {
+    get(target, prop) {
+      if (prop === 'headersSent') return mode !== null;
+      if (prop === 'writeHead') {
+        return (/** @type {number} */ code, /** @type {any[]} */ ...rest) => {
+          stop();
+          status = code;
+          const headers = rest.find(a => a && typeof a === 'object') || {};
+          const type = String(Object.entries(headers).find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? '');
+          mode = code >= 200 && code < 300 && type.includes('text/event-stream') ? 'pass' : 'error';
+          return held;
+        };
+      }
+      if (prop === 'write') {
+        return (/** @type {any} */ chunk, /** @type {any[]} */ ...rest) => {
+          if (mode === 'pass') return target.write(chunk, ...rest);
+          errorBody.push(toBuffer(chunk));
+          return true;
+        };
+      }
+      if (prop === 'end') {
+        return (/** @type {any} */ chunk, /** @type {any[]} */ ...rest) => {
+          stop();
+          if (mode === 'pass') { target.end(chunk, ...rest); return held; }
+          if (chunk != null && typeof chunk !== 'function') errorBody.push(toBuffer(chunk));
+          sendError();
+          return held;
+        };
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return {
+    res: held,
+    close: () => {
+      stop();
+      if (mode !== 'pass') sendError();
+    },
+  };
 }
 
 function clientGone(res) {
@@ -3285,9 +3386,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const waitMs = Math.min(retryAfter * 1000, ctx.holdBudgetMs, 60_000);
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
+      // A streaming request is answered now and pinged while it waits, when the
+      // operator opted in (see holdKeepalive). Once: later polls already write
+      // into the held response.
+      if (ctx.holdKeepalive && ctx.streamRequested && !ctx.keepalive && !res.headersSent) {
+        ctx.keepalive = holdKeepalive(res);
+        console.log(`[TeamClaude] Held a streaming request: answered with event-stream headers, pinging every ${HOLD_PING_MS / 1000}s while it waits`);
+      }
+      const out = ctx.keepalive?.res ?? res;
       await waitForRetry(waitMs, ctx.signal);
-      if (clientGone(res)) { ctx.abandoned = true; return; }
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      if (clientGone(out)) { ctx.abandoned = true; return; }
+      // An account this request already tried stays excluded for the rest of
+      // it, which is right between attempts seconds apart and wrong across a
+      // hold: an account refused for quota whose window then reset, early or on
+      // time, could never serve the request it was holding for, and a fleet
+      // whose every account had been tried held to the end of its budget for
+      // nothing. So each poll starts the request over: the accounts it tried,
+      // its retry count and its rate-limit hop are given back. Not an account
+      // that refused the credential itself, which no wait repairs. Selection
+      // still skips whatever is throttled or spent.
+      for (const i of ctx.tried) {
+        if (!ctx.credentialRejected?.has(accountManager.accounts[i]?.name)) ctx.tried.delete(i);
+      }
+      ctx.rateLimitHopped = false;
+      return forwardRequest(req, out, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx, route);
     }
 
     const exhaustedRetries = ctx.exhaustedRetries || 0;
