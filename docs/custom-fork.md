@@ -60,3 +60,28 @@ Served to loopback callers only (the same test as the key exemption: a loopback 
 `trustLoopback` not off), whatever key a caller presents. Only completions are kept (`/messages`, `/responses`, not
 `count_tokens`) of requests that carry a session id. The record holds a reference to the buffer already read for the
 forward, never writes to disk, and is capped at 400 sessions and 7 days; memory use is up to 400 request bodies.
+
+## Refusal log
+
+`TEAMCLAUDE_SAFEGUARDS_LOG=<file>` appends one JSON line to that file for every model refusal
+(`stop_reason: "refusal"`), streamed or buffered. Unset (the default) records nothing. A refusal reaches the proxy as
+an ordinary `200`, and the proxy is the only place that knows which account served it:
+
+```json
+{"ts":"…","account":"so…72497f","model":"claude-…","session":"…","request_id":"req_…","status":200,"stream":true,"req":1,"category":"cyber","explanation":"…","recommended_model":"…"}
+```
+
+`category`, `explanation` and `recommended_model` come from the refusal's `stop_details`. An account name that is
+an e-mail address is masked the way the [429 diagnostic](configuration.md#environment-variables) masks it (first two
+characters and a short hash, stable across lines). The line is appended without waiting and any failure is
+swallowed, so the log never delays or changes an answer.
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `TEAMCLAUDE_ALL_ANTHROPIC_TO_GLM=1` | Classify every `claude-*` model as a GLM request |
+| `TEAMCLAUDE_LAST_BODIES=1` | Keep each session's last request body; serve it on loopback `GET /teamclaude/last-bodies` |
+| `TEAMCLAUDE_SAFEGUARDS_LOG=<file>` | Append one JSON line per model refusal to `<file>` |
+
+Like every TeamClaude variable, each is also read as `TEAMROUTER_*`, which wins when both are set.

@@ -1,7 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
+import { appendFile, createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
@@ -3211,6 +3211,60 @@ function diag429Enabled() {
   return envVar('DIAG_429') === '1';
 }
 
+// Off unless TEAMCLAUDE_SAFEGUARDS_LOG names a file: one JSON line appended
+// per model refusal (`stop_reason: "refusal"`). A refusal reaches the proxy as
+// an ordinary 200, and the proxy is the only place that knows which account
+// served it. Appended without waiting, failures swallowed: the record must not
+// delay or break an answer, and the relayed bytes are not touched.
+
+/** @returns {string|undefined} */
+function refusalLogPath() {
+  return envVar('SAFEGUARDS_LOG') || undefined;
+}
+
+/**
+ * @param {import('node:http').IncomingMessage} req
+ * @param {Record<string, any>} ctx
+ * @param {Record<string, any>} account
+ * @param {{ status: number, headers: Headers }} upstreamRes
+ * @param {string|number} reqId
+ * @param {boolean} stream
+ */
+function refusalMeta(req, ctx, account, upstreamRes, reqId, stream) {
+  return {
+    account: maskDiagnostic(account.name), model: ctx.model ?? null, session: clientSessionId(req.headers),
+    request_id: upstreamRes.headers.get('request-id'), status: upstreamRes.status, stream, req: reqId,
+  };
+}
+
+/**
+ * @param {Record<string, unknown>} meta
+ * @param {unknown} details  the refusal's `stop_details`
+ */
+function logRefusal(meta, details) {
+  try {
+    const path = refusalLogPath();
+    if (!path) return;
+    const d = /** @type {Record<string, unknown>} */ (details && typeof details === 'object' ? details : {});
+    appendFile(path, JSON.stringify({
+      ts: new Date().toISOString(), ...meta,
+      category: d.category ?? null, explanation: d.explanation ?? null, recommended_model: d.recommended_model ?? null,
+    }) + '\n', () => {});
+  } catch { /* the record must never touch an answer */ }
+}
+
+/**
+ * @param {Buffer} buf  a buffered (non-streaming) response body
+ * @param {Record<string, unknown>} meta
+ */
+function logRefusalBody(buf, meta) {
+  try {
+    if (!buf.includes('"refusal"')) return;
+    const json = JSON.parse(buf.toString('utf8'));
+    if (json?.stop_reason === 'refusal') logRefusal(meta, json.stop_details);
+  } catch { /* not JSON */ }
+}
+
 /**
  * A string as it may appear in a diagnostic line: e-mail addresses become
  * their first two characters and a short hash (the same address always reads
@@ -4338,7 +4392,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+        const onRefusal = refusalLogPath()
+          ? (/** @type {unknown} */ details) => logRefusal(refusalMeta(req, ctx, account, upstreamRes, reqId, true), details)
+          : null;
+        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, onRefusal);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -4354,6 +4411,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+      if (refusalLogPath()) logRefusalBody(buf, refusalMeta(req, ctx, account, upstreamRes, reqId, false));
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -4551,7 +4609,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, onRefusal = null) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -4571,7 +4629,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   // remembers that it did — the incremental counters would book the turn again
   // if a second terminal event arrived. See parseSSEDataLine.
   const responsesTurn = { settled: false };
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage));
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage, onRefusal));
 
   try {
     while (true) {
@@ -4728,12 +4786,14 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
+ * @param {((details: unknown) => void)|null} [onRefusal] told the `stop_details` of a refusal
  */
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null) {
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, onRefusal = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
     const data = JSON.parse(line.slice(6));
+    if (data.type === 'message_delta' && data.delta?.stop_reason === 'refusal') onRefusal?.(data.delta.stop_details);
     if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
