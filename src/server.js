@@ -1890,6 +1890,47 @@ function waitForRetry(ms, signal) {
   });
 }
 
+// How long a 401 on a refresh-less OAuth account waits for a newer token to
+// appear on disk, and how often it re-reads while it waits.
+const ROTATED_TOKEN_WAIT_MS = 8000;
+const ROTATED_TOKEN_POLL_MS = 1000;
+// One wait per account, shared by every request that drew a 401 from it: a
+// burst of them is one re-read loop, not one per request. Keyed by the account
+// object, since a reload that removes an account renumbers the rest.
+/** @type {WeakMap<Record<string, any>, Promise<void>>} */
+const rotatedTokenWaits = new WeakMap();
+
+/**
+ * Re-read the accounts from disk until `account` holds a token other than
+ * `sent`, or ROTATED_TOKEN_WAIT_MS has passed.
+ *
+ * An OAuth account with no refresh token cannot renew itself: its token is
+ * written by something else — the client that owns the login, through an
+ * `importFrom` file, or a tool that rewrites the config. When that client
+ * refreshes, upstream revokes the old token at once, and the file catches up a
+ * moment later. A 401 in that gap is the rotation, not a dead credential.
+ *
+ * @param {Record<string, any>} account
+ * @param {string} sent
+ * @param {() => Promise<unknown>} reload
+ * @returns {Promise<void>}
+ */
+function awaitRotatedToken(account, sent, reload) {
+  let wait = rotatedTokenWaits.get(account);
+  if (!wait) {
+    wait = (async () => {
+      const deadline = Date.now() + ROTATED_TOKEN_WAIT_MS;
+      for (;;) {
+        try { await reload(); } catch { /* a failed re-read is one more poll, not an answer */ }
+        if (account.credential !== sent || Date.now() >= deadline) return;
+        await new Promise(resolve => setTimeout(resolve, ROTATED_TOKEN_POLL_MS));
+      }
+    })().finally(() => rotatedTokenWaits.delete(account));
+    rotatedTokenWaits.set(account, wait);
+  }
+  return wait;
+}
+
 function clientGone(res) {
   return !!res.destroyed || !!res.stream?.destroyed;
 }
@@ -3190,6 +3231,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // both use a bearer token, Anthropic API keys use x-api-key, and Codex also
   // needs ChatGPT-Account-Id to scope the token to one account.
   applyAuthHeaders(headers, account);
+  // What this attempt presents, so a 401 can tell whether it is about the
+  // token the account holds now or one it has already replaced.
+  const sentCredential = account.credential;
 
   const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
   const method = req.method;
@@ -3686,6 +3730,35 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         : '';
       console.error(`[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
+    // A 401 for a token the account no longer holds is about the old one: a
+    // reload or a refresh replaced it while this request was in flight. Taking
+    // it as a verdict on the account sidelined a healthy one — for an OAuth
+    // account with no refresh token, until its token next changed on disk. So
+    // the request goes again on the same account, with the token it holds now.
+    //
+    // A refresh-less OAuth account first waits a moment for that newer token
+    // (see awaitRotatedToken): its 401 is most often the gap between the owning
+    // client's refresh and the file catching up, and failing over meanwhile
+    // sends the request to accounts that may be out of quota. Once per account
+    // per request; with no newer token by then, the 401 falls through to the
+    // branches below, which take the account out of rotation and fail over.
+    if (upstreamRes.status === 401 && !res.headersSent && retryCount < maxRetries
+        && !(ctx.rotationChecked ??= new Set()).has(account.index)) {
+      ctx.rotationChecked.add(account.index);
+      if (account.credential === sentCredential && account.type === 'oauth' && !account.refreshToken && hooks.reload) {
+        await upstreamRes.body?.cancel();
+        console.log(`[TeamClaude] 401 on "${safeLine(account.name, 64)}" — it has no refresh token; re-reading its token from disk`);
+        await awaitRotatedToken(account, sentCredential, hooks.reload);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+      }
+      if (account.credential !== sentCredential) {
+        await upstreamRes.body?.cancel();
+        console.log(`[TeamClaude] 401 on "${safeLine(account.name, 64)}" for a token it has since replaced — retrying with the current one`);
+        ctx.hopTo = account.index;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
     }
 
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken

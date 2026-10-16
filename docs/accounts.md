@@ -51,7 +51,7 @@ Instead of storing an OAuth account's tokens in `teamclaude.json`, an account en
 { "name": "me@example.com", "type": "oauth", "importFrom": "~/.claude/.credentials.json" }
 ```
 
-The tokens (`accessToken`, `refreshToken`, `expiresAt`) are read from that file at startup and again on every config reload, so a login refreshed by Claude Code itself is picked up without re-running `teamclaude import`. Every other field on the entry (`priority`, `disabled`, `upstream`, `modelMap`, …) is kept as written. A file with no token skips the account with a message rather than sending an empty credential upstream. `teamclaude import` is the alternative: it copies the tokens into the config once.
+The tokens (`accessToken`, `refreshToken`, `expiresAt`) are read from that file at startup and again on every config reload, so a login refreshed by Claude Code itself is picked up without re-running `teamclaude import`. A 401 on an account whose file holds no refresh token also re-reads it, and waits briefly for a rotated token (see [When the key is rejected](#when-the-key-is-rejected-401)). Every other field on the entry (`priority`, `disabled`, `upstream`, `modelMap`, …) is kept as written. A file with no token skips the account with a message rather than sending an empty credential upstream. `teamclaude import` is the alternative: it copies the tokens into the config once.
 
 ## API key
 
@@ -71,7 +71,12 @@ The hold lengthens while the key keeps being rejected: 1 minute after the first 
 
 While the hold lasts, `status`, the TUI and the dashboard show the account as blocked with "upstream rejected its API key with a 401", and the server log says how long the hold is. Reloading a config that carries a different key for the account, or disabling and re-enabling it, lifts the hold at once.
 
-An OAuth account is different. A 401 there triggers a token refresh, and an account that has no refresh token to try is taken out of rotation until it is logged in again.
+An OAuth account is different. A 401 there triggers a token refresh, and an account that has no refresh token to try is taken out of rotation until it is logged in again — or until a reload finds a different token for it on disk.
+
+Two cases are not taken as a rejection of the account:
+
+- **The token was already replaced.** A 401 for a token the account no longer holds — a reload or a refresh swapped it while the request was in flight — is about the old token. The request is sent again on the same account with the current one, for every account type.
+- **An account with no refresh token is mid-rotation.** Such an account's token is written by something else: the client that owns the login, through an [`importFrom`](#delegating-credentials-to-a-file-importfrom) file, or a tool that rewrites the config. When that client refreshes, upstream revokes the old token at once, and the file catches up a moment later. So a 401 first re-reads the accounts from disk, once a second for up to 8 seconds, and the request goes again on the same account as soon as a newer token appears. Requests that draw a 401 from the same account at the same time share one such wait. Only when no newer token appears is the account taken out of rotation and the request failed over — a token that really is dead costs that request the 8 seconds.
 
 ## Multiple organizations
 
