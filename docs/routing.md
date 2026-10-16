@@ -20,6 +20,18 @@ TeamClaude prefers to keep you on one account. It stays on the current one and o
 
 When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
 
+### Fallback tiers
+
+`priority` is a preference: a priority-100 account serves whenever nothing ahead of it can, for any reason — a per-minute 429 pause, the one-hop failover on a 5xx or a rate limit, a transport error, a refused credential. For a metered API key or a third-party backend kept as a last resort, that means money spent or a different model answering because a subscription hiccuped for a few seconds.
+
+`accounts[].fallbackTier` draws a hard line instead. Accounts default to tier `0`. An account in tier `1` (or any higher number) is a candidate only once every account of a lower tier that could serve the request — same provider, allowed by the model's route — is **spent**: disabled, at its `maxUsage` or `maxSpend` cap, or out of quota (at the switch threshold, or rejected by upstream). Until then the request stays in the lower tier and does what it would do with no higher tier configured: waits out a rate-limit pause inline, holds under `holdSeconds`, or returns the upstream error or a 429 with the lower tier's own retry-after.
+
+The tier follows the readings, not a latch: once a lower-tier window resets, or an operator re-enables an account, the higher tier closes again and traffic moves back. Within an open tier, `priority` and the usual rules choose as before. The request model alone decides: an advisor model's family bucket never opens a tier. The [extra-usage fallback](quota.md#extra-usage-fallback) runs only when no account in any tier can serve, so a higher tier with headroom is spent before an opted-in account's overage is.
+
+```json
+{ "name": "metered-key", "type": "apikey", "apiKey": "sk-ant-api03-...", "priority": 100, "fallbackTier": 1 }
+```
+
 ## The two kinds of 429
 
 Reacting the wrong way to either one makes things worse, so they are handled separately.

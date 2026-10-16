@@ -3,7 +3,7 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting, accountFallbackTier } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
 
 /**
@@ -105,6 +105,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     }
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    mgr.fallbackTier = accountFallbackTier(diskAcct);
     // A list position edited on disk applies on reload for the same reason a
     // priority edit does, and `null` rather than `??` so deleting the field
     // puts the account back among the unplaced instead of leaving it stuck at
@@ -178,6 +179,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
       if (diskAcct.routing) cfgAcct.routing = diskAcct.routing; else delete cfgAcct.routing;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
+      if (diskAcct.fallbackTier != null) cfgAcct.fallbackTier = diskAcct.fallbackTier; else delete cfgAcct.fallbackTier;
       // The TUI's reorder writes this key onto the entry, so after one
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
