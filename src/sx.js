@@ -14,8 +14,40 @@
 
 import net from 'node:net';
 import tls from 'node:tls';
+import { envVar } from './brand.js';
 
 const CONNECT_TIMEOUT_MS = 30000; // residential exits can be slow to establish
+
+/**
+ * How long the CONNECT, and then the TLS handshake over it, may take, each.
+ *
+ * 30s suits a residential exit, which can be slow to establish. A local or
+ * corporate proxy completes both in well under a second, and when one stalls
+ * the full 30s is time every request through it spends waiting on a socket
+ * that will never open. TEAMCLAUDE_TUNNEL_TIMEOUT_MS shortens it. Read per
+ * call, so a test can set it; unset, empty, zero, negative or unparseable all
+ * mean the default.
+ *
+ * @returns {number}
+ */
+export function tunnelTimeoutMs() {
+  const env = Number(envVar('TUNNEL_TIMEOUT_MS'));
+  return env > 0 ? env : CONNECT_TIMEOUT_MS;
+}
+
+/**
+ * A tunnel that did not open in time. It carries ETIMEDOUT so the forward path
+ * reads it as what it is, a network failure: every account dials through the
+ * same proxy, so failing over to the next one cannot help. Without a code it
+ * was taken for a failure of the account, which was then skipped for the rest
+ * of the request while the request walked the fleet through the same stalled
+ * proxy.
+ *
+ * @param {string} message
+ */
+function tunnelTimeoutError(message) {
+  return Object.assign(new Error(message), { code: 'ETIMEDOUT' });
+}
 
 // Resolved per call (not at import) so tests can point it at a local mock.
 //
@@ -100,14 +132,14 @@ function parsePort(p) {
  * Open a CONNECT tunnel through an HTTP proxy to targetHost:targetPort and
  * resolve with the raw (still-plaintext) socket once the proxy answers 200.
  */
-export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, targetPort, timeout = CONNECT_TIMEOUT_MS, label = 'sx.org proxy' }) {
+export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, targetPort, timeout = tunnelTimeoutMs(), label = 'sx.org proxy' }) {
   return new Promise((resolve, reject) => {
     // autoSelectFamily (happy-eyeballs) — default on Node 20+ but not 18; set it
     // so a dual-stack proxy host whose IPv6 path is unreachable falls back to IPv4
     // instead of hanging the connect (sx.org returns an IP, but be robust).
     const sock = net.connect({ port: proxyPort, host: proxyHost, autoSelectFamily: true });
     let buf = '';
-    const timer = setTimeout(() => fail(new Error(`${label} CONNECT timed out after ${timeout}ms`)), timeout);
+    const timer = setTimeout(() => fail(tunnelTimeoutError(`${label} CONNECT timed out after ${timeout}ms`)), timeout);
     const cleanup = () => {
       clearTimeout(timer);
       sock.removeListener('data', onData);
@@ -147,7 +179,7 @@ export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, ta
  * behind it. Cert verification stays at its secure default; tests inject a CA
  * via tlsOptions.ca.
  */
-export function handshakeOverTunnel(sock, { servername, tlsOptions = {}, timeout = CONNECT_TIMEOUT_MS }) {
+export function handshakeOverTunnel(sock, { servername, tlsOptions = {}, timeout = tunnelTimeoutMs() }) {
   return new Promise((resolve, reject) => {
     const tlsSock = tls.connect({ socket: sock, servername, ...tlsOptions });
     const settle = () => { clearTimeout(timer); tlsSock.removeListener('secureConnect', onOk); tlsSock.removeListener('error', onErr); };
@@ -155,7 +187,7 @@ export function handshakeOverTunnel(sock, { servername, tlsOptions = {}, timeout
     // a sink: a late error from the teardown must not become an uncaught one.
     const onErr = (err) => { settle(); tlsSock.on('error', () => {}); tlsSock.destroy(); sock.destroy(); reject(err); };
     const onOk = () => { settle(); resolve(tlsSock); };
-    const timer = setTimeout(() => onErr(new Error(`TLS handshake with ${servername} through the tunnel timed out after ${timeout}ms`)), timeout);
+    const timer = setTimeout(() => onErr(tunnelTimeoutError(`TLS handshake with ${servername} through the tunnel timed out after ${timeout}ms`)), timeout);
     tlsSock.once('secureConnect', onOk);
     tlsSock.once('error', onErr);
   });
