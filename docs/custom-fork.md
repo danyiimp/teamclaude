@@ -44,3 +44,19 @@ reason other than quota (a refused credential, a transport error that failed ove
 the client and the log say why the last-resort tier was not used. Under `holdSeconds` a transport failure is retried
 by the hold first. The upstream "every account refused the credential" `502` now counts only the accounts that could
 serve the request (provider, route, open tier, not disabled).
+
+## Last request body per session
+
+`TEAMCLAUDE_LAST_BODIES=1` keeps, in memory, the last request body each session sent upstream (after the proxy's own
+rewrites) — the only exact record of the context a session had at that moment, since a transcript lacks the system
+prompt and the tool definitions. Off by default; with it off the route does not exist.
+
+- `GET /teamclaude/last-bodies` lists `{session, ts, url, model, account, size}` for every kept session.
+- `GET /teamclaude/last-bodies?session=<id>` returns the raw body; its metadata (url, model, account and a whitelist
+  of request headers: `anthropic-beta`, `anthropic-version`, `user-agent`, `x-app`, `content-type`, … — never a
+  credential) is URI-encoded JSON in the `x-snap-meta` response header.
+
+Served to loopback callers only (the same test as the key exemption: a loopback peer, no forwarding header,
+`trustLoopback` not off), whatever key a caller presents. Only completions are kept (`/messages`, `/responses`, not
+`count_tokens`) of requests that carry a session id. The record holds a reference to the buffer already read for the
+forward, never writes to disk, and is capped at 400 sessions and 7 days; memory use is up to 400 request bodies.

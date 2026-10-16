@@ -673,6 +673,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // The kept request bodies carry whole conversations, so this machine
+      // only, whatever key the caller holds; and only while the record is on.
+      if (req.method === 'GET' && lastBodiesEnabled()
+        && (req.url === '/teamclaude/last-bodies' || req.url?.startsWith('/teamclaude/last-bodies?'))) {
+        if (!isLocal) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'request refused: the last request bodies are served to this machine only' }));
+          return;
+        }
+        serveLastBodies(req, res);
+        return;
+      }
+
       // Tier-weighted fleet quota for lightweight consumers such as a shell or
       // Claude Code status line. Unlike /teamclaude/status this omits routing,
       // usage counters and server diagnostics, and never reaches upstream.
@@ -1421,6 +1434,81 @@ const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
 export function clientSessionId(headers) {
   const raw = headers['x-claude-code-session-id'] ?? headers['session-id'];
   return typeof raw === 'string' && SESSION_ID_SHAPE.test(raw) ? raw : null;
+}
+
+// Off unless TEAMCLAUDE_LAST_BODIES=1: the last body each session sent
+// upstream, kept in memory and served to this machine only on
+// GET /teamclaude/last-bodies. It is the only exact record of the context a
+// session had at that moment — a transcript lacks the system prompt, the tool
+// definitions and the proxy's own rewrites. A reference to the buffer already
+// held for the forward, never a copy, never written to disk, and bounded by
+// session count and age. Of the request headers only LAST_BODY_HEADERS are
+// kept, so no credential is.
+const LAST_BODIES = /** @type {Map<string, { ts: number, url: string, model: string|null, account: string|null, headers: Record<string, string>, body: Buffer }>} */ (new Map());
+const LAST_BODIES_MAX = 400;
+const LAST_BODIES_TTL_MS = 7 * 24 * 3600 * 1000;
+const LAST_BODY_HEADERS = ['anthropic-beta', 'anthropic-version', 'user-agent', 'x-app', 'x-stainless-package-version', 'content-type', 'originator', 'openai-beta', 'version'];
+
+/** @returns {boolean} */
+function lastBodiesEnabled() {
+  return envVar('LAST_BODIES') === '1';
+}
+
+/**
+ * Keep `sendBody` as the session's last body. Never throws: a failure here
+ * must not touch the request.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {Buffer} sendBody
+ * @param {Record<string, any>} account
+ * @param {Record<string, any>} ctx
+ */
+function noteLastBody(req, sendBody, account, ctx) {
+  try {
+    if (!lastBodiesEnabled() || req.method !== 'POST' || !sendBody?.length) return;
+    const url = req.url || '';
+    if (url.includes('count_tokens') || !(url.includes('/messages') || url.includes('/responses'))) return;
+    const session = clientSessionId(req.headers);
+    if (!session) return;
+    /** @type {Record<string, string>} */
+    const headers = {};
+    for (const h of LAST_BODY_HEADERS) if (typeof req.headers[h] === 'string') headers[h] = req.headers[h];
+    const now = Date.now();
+    LAST_BODIES.delete(session);
+    LAST_BODIES.set(session, { ts: now, url, model: ctx.model ?? null, account: account.name ?? null, headers, body: sendBody });
+    for (const [key, entry] of LAST_BODIES) {
+      if (LAST_BODIES.size <= LAST_BODIES_MAX && now - entry.ts < LAST_BODIES_TTL_MS) break;
+      LAST_BODIES.delete(key);
+    }
+  } catch { /* the record must never touch a request */ }
+}
+
+/**
+ * GET /teamclaude/last-bodies lists the kept sessions; `?session=<id>` returns
+ * that session's raw body, with its metadata URI-encoded in `x-snap-meta`.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ */
+function serveLastBodies(req, res) {
+  const session = new URL(req.url || '/', 'http://localhost').searchParams.get('session');
+  const now = Date.now();
+  if (!session) {
+    const list = [...LAST_BODIES].filter(([, v]) => now - v.ts < LAST_BODIES_TTL_MS)
+      .map(([k, v]) => ({ session: k, ts: v.ts, url: v.url, model: v.model, account: v.account, size: v.body.length }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(list));
+    return;
+  }
+  const entry = LAST_BODIES.get(session);
+  if (!entry || now - entry.ts >= LAST_BODIES_TTL_MS) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'no body for this session' }));
+    return;
+  }
+  const { body, ...meta } = entry;
+  res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'x-snap-meta': encodeURIComponent(JSON.stringify({ session, ...meta })) });
+  res.end(body);
 }
 
 /**
@@ -3610,6 +3698,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
   if (sendBody !== body) headers['content-length'] = String(sendBody.length);
+  noteLastBody(req, sendBody, account, ctx);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
   // pure-429-then-retry attempt writes no file, matching prior behavior). The
