@@ -2,6 +2,8 @@
 // selection. Kept dependency-free so the low-level h2/h1 relay can peek a
 // request's model without pulling in the account-manager graph.
 
+import { rootKeyOffset, ROOT_OPEN } from './json-root-key.js';
+
 // A request targets the Fable model family when its `model` id names Fable
 // (e.g. "claude-fable-5"). Account selection uses this to gate the Fable-only
 // weekly bucket: a Fable-exhausted account still serves every other model.
@@ -443,7 +445,11 @@ export function parseRequestStream(body) {
   try {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
     const finder = new TopLevelFieldFinder('stream');
-    return finder.push(buf) === 'true' && finder.scalar;
+    // Claude Code sends `stream` last: start at it (see json-root-key.js).
+    const at = rootKeyOffset(buf, 'stream');
+    if (at === -1) return false;
+    if (at !== null) finder.push(ROOT_OPEN);
+    return finder.push(at === null ? buf : buf.subarray(at)) === 'true' && finder.scalar;
   } catch { return false; }
 }
 
@@ -596,7 +602,13 @@ export function parseRequestEffort(body, provider = 'anthropic') {
   try {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
     if (!buf.includes('"effort"')) return null;
-    return new NestedFieldFinder(parentKey, 'effort').push(buf) || null;
+    const finder = new NestedFieldFinder(parentKey, 'effort');
+    // Not -1 as absent: this finder unescapes keys, so the parent may be
+    // spelled in a way the byte search does not see.
+    const at = rootKeyOffset(buf, parentKey);
+    if (at === null || at === -1) return finder.push(buf) || null;
+    finder.push(ROOT_OPEN);
+    return finder.push(buf.subarray(at)) || null;
   } catch { return null; }
 }
 
@@ -718,6 +730,10 @@ export function parseAdvisorModel(body) {
   try {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
     if (!buf.includes('advisor')) return null;
-    return new AdvisorModelFinder().push(buf);
+    const finder = new AdvisorModelFinder();
+    const at = rootKeyOffset(buf, 'tools');
+    if (at === -1) return null;
+    if (at !== null) finder.push(ROOT_OPEN);
+    return finder.push(at === null ? buf : buf.subarray(at));
   } catch { return null; }
 }

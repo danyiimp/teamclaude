@@ -17,6 +17,8 @@
 // (`accounts[].deviceId`), for a setup that runs each account under its own
 // Claude Code profile and resumes one conversation under another's.
 
+import { rootKeyOffset, ROOT_OPEN } from './json-root-key.js';
+
 // Byte sequence of `<field>":"` as it appears INSIDE the (escaped) user_id
 // string: field \ " : \ "
 /** @param {string} field */
@@ -191,6 +193,15 @@ export function patchDeviceId(buf, newDeviceId) {
  * @param {Buffer} buf
  */
 function patchWith(p, buf) {
+  // Only the root `metadata` can hold the field, and Claude Code sends it near
+  // the end: patch from there and keep the head as it is (see json-root-key.js).
+  const at = rootKeyOffset(buf, 'metadata');
+  if (at === -1) return buf;
+  if (at !== null) {
+    p.push(ROOT_OPEN);
+    const tail = p.push(buf.subarray(at));
+    return p.changed ? Buffer.concat([buf.subarray(0, at), tail]) : buf;
+  }
   const out = p.push(buf);
   return p.changed ? out : buf;
 }
