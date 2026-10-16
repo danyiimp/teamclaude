@@ -3097,7 +3097,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Measured once and used twice: the accounts the message counts and the
     // windows the retry-after is read from have to be the same accounts, or the
     // two halves of one sentence contradict each other.
-    const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider);
+    // A fallback tier that is still closed is not something this request is
+    // waiting on: its accounts are healthy, and counting them would read as an
+    // immediate retry while the accounts that can serve are the paused ones.
+    const closedTiers = accountManager._excludeClosedTiers(null, ctx.provider || DEFAULT_PROVIDER, ctx.model);
+    const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider)
+      .filter((/** @type {Record<string, any>} */ a) => !closedTiers?.has(a.index));
     const retryAfter = computeRetryAfter(accountManager, candidates, ctx.model);
 
     // Long-hold mode: hold the HTTP connection and poll until an account

@@ -115,6 +115,22 @@ function resetTimestamp(value) {
 // `default` — the same value the single-number form has always used.
 export const DEFAULT_SWITCH_THRESHOLD = 0.98;
 
+// Why an account cannot serve that lasts until a window resets or the operator
+// acts: a lower fallback tier made only of these is spent, and the next tier
+// opens. Everything else unavailableReason names (a rate-limit pause, a refused
+// credential, an unreachable routing proxy, an error state) is a passing
+// failure, and so is an account a request has merely tried.
+const TIER_SPENT_REASONS = new Set(['disabled', 'spend-capped', 'capped', 'exhausted', 'quota', 'upstream-rejected']);
+
+/**
+ * `accounts[].fallbackTier`: a whole number of 1 or more, else 0.
+ * @param {Record<string, any>} acct
+ * @returns {number}
+ */
+export function accountFallbackTier(acct) {
+  return Number.isInteger(acct.fallbackTier) && acct.fallbackTier > 0 ? acct.fallbackTier : 0;
+}
+
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
@@ -336,6 +352,10 @@ function makeAccount(acct, index, listener = null) {
     hasClaudeMax: acct.hasClaudeMax ?? null,
     hasClaudePro: acct.hasClaudePro ?? null,
     priority: acct.priority || 0,
+    // A hard boundary under `priority`: an account in tier N serves only once
+    // every account of a lower tier that could take the request is spent (see
+    // _excludeClosedTiers). 0 — the default — is the first tier.
+    fallbackTier: accountFallbackTier(acct),
     // Where this account sits in the list the TUI draws, arranged by the
     // operator from the settings screen. Presentation only: nothing but
     // _displayOrder in tui.js reads it, and it is emphatically NOT `priority`
@@ -1120,7 +1140,7 @@ export class AccountManager {
     // upstream round trip, by which time another request has selected.
     this._selectionDecision = decision;
     try {
-      const excluded = this._excludeOtherProviders(exclude, provider);
+      const excluded = this._excludeClosedTiers(this._excludeOtherProviders(exclude, provider), provider, model);
       // Settled once, here, rather than in the walks: session distribution and
       // the untagged spread select on the advisor model as well, so a check
       // inside _select alone would miss exactly the configurations that spread.
@@ -1349,7 +1369,7 @@ export class AccountManager {
    * provider partition, the expiry band. Returns the account or null.
    */
   pickAlternate(exclude, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
-    const excluded = this._excludeOtherProviders(exclude, provider);
+    const excluded = this._excludeClosedTiers(this._excludeOtherProviders(exclude, provider), provider, model);
     // The fallback as a last resort, through the same pure picker the
     // selection walk uses: a 429/5xx hop off a probed, spent account would
     // otherwise end the request in a 429 while an account that can still serve
@@ -1407,6 +1427,42 @@ export class AccountManager {
     if (foreign.length === 0) return exclude;
     const combined = new Set(exclude || []);
     for (const account of foreign) combined.add(account.index);
+    return combined;
+  }
+
+  /**
+   * Widen a request's exclude set to every account in a fallback tier that is
+   * not open yet.
+   *
+   * `priority` orders accounts but lets any of them serve the moment those
+   * ahead of it cannot — a rate-limit pause, a 5xx hop, a transport error, a
+   * refused credential. A tier is stricter: tier N opens only when every account
+   * of a lower tier that could serve this request (its provider, its model's
+   * route) is disabled, capped or out of quota. A passing failure there keeps
+   * the request in the lower tier, where it waits, holds or fails as it would
+   * with no higher tier configured. What opens a tier is a reading, so the
+   * moment a lower-tier window resets the higher tier closes again.
+   *
+   * Expressed as exclusion like the provider partition, so the stay-on-current
+   * check, session pins, distribution, the revalidation probe and the
+   * extra-usage fallback all honour it without knowing about tiers. Judged on
+   * the request model only: an advisor's family never opens a tier.
+   * Returns the caller's set untouched when no account sets a tier.
+   * @template {Set<number>|null|undefined} T
+   * @param {T} exclude
+   * @param {string} provider
+   * @returns {T|Set<number>}
+   */
+  _excludeClosedTiers(exclude, provider, model = null) {
+    if (!this.accounts.some(a => a.fallbackTier > 0)) return exclude;
+    const open = Math.min(...this.accounts
+      .filter(a => canServeProvider(a, provider) && (!model || this._routeAllows(a, model))
+        && !TIER_SPENT_REASONS.has(this.unavailableReason(a, model) ?? ''))
+      .map(a => a.fallbackTier));
+    const closed = this.accounts.filter(a => a.fallbackTier > open);
+    if (closed.length === 0) return exclude;
+    const combined = new Set(exclude || []);
+    for (const account of closed) combined.add(account.index);
     return combined;
   }
 
@@ -5282,6 +5338,7 @@ export class AccountManager {
         provider: providerOf(a),
         orgName: a.orgName || null,
         priority: a.priority || 0,
+        fallbackTier: a.fallbackTier,
         // The attached TUI spreads these fields onto its own account objects
         // and sorts its rows by this one, so without it `teamclaude attach`
         // draws array order beside a server TUI drawing the arrangement.
