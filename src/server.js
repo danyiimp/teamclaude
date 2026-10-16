@@ -3534,6 +3534,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // both use a bearer token, Anthropic API keys use x-api-key, and Codex also
   // needs ChatGPT-Account-Id to scope the token to one account.
   applyAuthHeaders(headers, account);
+  // A gateway that routes to exact models honours this header by refusing a
+  // model it cannot serve instead of quietly substituting another.
+  if (account.strictModel) headers['x-strict-model'] = 'true';
   // What this attempt presents, so a 401 can tell whether it is about the
   // token the account holds now or one it has already replaced.
   const sentCredential = account.credential;

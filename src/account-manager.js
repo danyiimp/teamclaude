@@ -399,6 +399,8 @@ function makeAccount(acct, index, listener = null) {
     // between providers keeps saying the same thing.
     autoRedeemReset: acct.autoRedeemReset !== false,
     upstream: acct.upstream || null,
+    // Asks a gateway that substitutes models to serve the requested one or fail.
+    strictModel: acct.strictModel === true,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
     // that reject e.g. `context_management`). See server.js stripBodyFields.

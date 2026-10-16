@@ -21,3 +21,10 @@ as `x-api-key`, 10-minute header wait). An account joins it with `"provider": "g
 
 Upstream already serves GLM as a [third-party backend](accounts.md#third-party-backend-accounts) (`upstream` +
 `modelMap` + a route). The provider adds the partition and the switch on top.
+
+## Exact-model routing on a gateway
+
+`accounts[].strictModel: true` sends `x-strict-model: true` on every request of that account. Some
+Anthropic-compatible gateways substitute a different model when the requested one is unavailable; the header asks
+those that support it to refuse instead, so a session never runs on a model it did not ask for. Gateways that do not
+know the header ignore it. A config reload applies an edit live.
