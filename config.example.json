@@ -19,6 +19,7 @@
   "synthesizeQuotaHeaders": false,
   "holdSeconds": 0,
   "holdKeepalive": false,
+  "exhaustionQuotaHeaders": false,
   "distributeSessions": false,
   "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,

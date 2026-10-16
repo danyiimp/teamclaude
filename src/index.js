@@ -625,6 +625,8 @@ async function serverCommand() {
     // not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
+    // Sampled per request like the header flags below (shouldStateExhaustion).
+    config.exhaustionQuotaHeaders = diskConfig.exhaustionQuotaHeaders === true;
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
     // applies to subsequent requests.
