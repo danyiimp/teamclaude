@@ -261,6 +261,46 @@ export function shouldSynthesizeQuotaHeaders(config) {
 }
 
 /**
+ * Off unless `exhaustionQuotaHeaders: true` — see exhaustionQuotaHeaders.
+ *
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+export function shouldStateExhaustion(config) {
+  return /** @type {{ exhaustionQuotaHeaders?: unknown } | null | undefined} */ (config)?.exhaustionQuotaHeaders === true;
+}
+
+// The 429 the proxy answers when no account can serve a request carried only a
+// `retry-after`. Claude Code reads a quota refusal off the unified headers of
+// Anthropic's own 429, not off the status: without them it reports "Server is
+// temporarily limiting requests (not your usage limit)", where it would
+// otherwise say "You've hit your session limit · resets …" and offer to
+// continue on its own at that time. These are the headers of that refusal, for the window the wait
+// belongs to: the weekly one when the wait is longer than a 5-hour window can
+// be, the 5-hour one otherwise. The proxy does not know which window of which
+// account will clear first, only how long until one does, so this is the
+// shape of the answer rather than a report of a particular account.
+const FIVE_HOUR_WINDOW_SECONDS = 5 * 3600;
+
+/**
+ * @param {number} retryAfter  seconds, as computed for the `retry-after` beside it
+ * @param {number} [now]
+ * @returns {Record<string, string>}
+ */
+export function exhaustionQuotaHeaders(retryAfter, now = Date.now()) {
+  const reset = String(Math.floor(now / 1000) + retryAfter);
+  const [window, claim] = retryAfter > FIVE_HOUR_WINDOW_SECONDS ? ['7d', 'seven_day'] : ['5h', 'five_hour'];
+  return {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-reset': reset,
+    'anthropic-ratelimit-unified-representative-claim': claim,
+    [`anthropic-ratelimit-unified-${window}-status`]: 'rejected',
+    [`anthropic-ratelimit-unified-${window}-reset`]: reset,
+    [`anthropic-ratelimit-unified-${window}-utilization`]: '1.0',
+  };
+}
+
+/**
  * The client-header flags a reload copies off the disk config, both sampled
  * per request through the two functions above.
  *
@@ -1668,10 +1708,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      // stripOverage and synthesizeQuota are sampled once here, at dispatch:
+      // stripOverage, synthesizeQuota and stateExhaustion are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), stateExhaustion: shouldStateExhaustion(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -3124,9 +3164,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    // Stated only for an Anthropic request with an account that is waiting on a
+    // window. Every eligible account disabled, needing a re-login or behind an
+    // unreachable routing proxy is not a quota refusal, and nothing resets at
+    // the time the headers would name.
+    const now = Date.now();
+    const waitsOnQuota = ctx.stateExhaustion === true && ctx.provider === DEFAULT_PROVIDER
+      && candidates.some(a => !a.disabled && a.status !== 'error' && !(a.routingFailedUntil > now));
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
+      ...(waitsOnQuota ? exhaustionQuotaHeaders(retryAfter, now) : {}),
     });
     res.end(JSON.stringify({
       type: 'error',
