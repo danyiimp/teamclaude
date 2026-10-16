@@ -161,6 +161,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // Read per request like the two above (server.js rewriteRequestBody), and
     // missing from this sync until #374: an edit waited for a restart.
     mgr.stripRequestFields = diskAcct.stripRequestFields || null;
+    // Read per request too (server.js rewriteRequestBody).
+    mgr.deviceId = diskAcct.deviceId || null;
     mgr.messageThreads = diskAcct.messageThreads === true;
     // Mirror onto the memConfig entry: the TUI save stencil rebuilds
     // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
@@ -172,6 +174,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
+      if (diskAcct.deviceId) cfgAcct.deviceId = diskAcct.deviceId; else delete cfgAcct.deviceId;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
       if (diskAcct.maxSpend != null) cfgAcct.maxSpend = diskAcct.maxSpend; else delete cfgAcct.maxSpend;

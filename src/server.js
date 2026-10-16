@@ -5,7 +5,7 @@ import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
-import { patchAccountUuid } from './account-uuid-rewrite.js';
+import { patchAccountUuid, patchDeviceId } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
@@ -4288,6 +4288,9 @@ export function rewriteRequestBody(body, account, url, contentType) {
     // Align the body's account_uuid (in metadata.user_id) with the account whose
     // token we're injecting (same-length patch; no-op if absent).
     if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
+    // Same for device_id, only where the operator gave the account one
+    // (`accounts[].deviceId`); otherwise the client's own stays.
+    if (account.deviceId) sendBody = patchDeviceId(sendBody, account.deviceId);
     // Block types a strict upstream rejects (`tool_addition` once a tool appears
     // mid-conversation) stay in the history, so one of them fails every later
     // turn too. Opt-in: `stripRequestFields: ["content.tool_addition"]`. Runs
