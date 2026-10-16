@@ -57,6 +57,13 @@
       "priority": 0
     },
     {
+      "name": "codex-shared",
+      "type": "oauth",
+      "provider": "codex",
+      "importFrom": "~/.codex-second/auth.json",
+      "manageRefresh": false
+    },
+    {
       "name": "api-fallback",
       "type": "apikey",
       "priority": 10,

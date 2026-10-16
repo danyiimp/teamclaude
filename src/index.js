@@ -463,7 +463,9 @@ async function serverCommand() {
   // accounts added externally, e.g. by `teamclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
-    if (!account) return;
+    // A token another client owns lives in that client's file. A copy in the
+    // config would also outrank the file on the next read (see credentialFile).
+    if (!account || !account.manageRefresh) return;
     // Keep config.accounts in sync so the TUI save does not clobber fresh tokens.
     // A -1 means no config entry pairs with this account and the in-memory copy
     // keeps what it had; the disk write below is unaffected either way, since it

@@ -117,7 +117,7 @@ function segment(/** @type {unknown} */ v) {
  * @param {Record<string, any>|null|undefined} a
  */
 export function isSyncable(a) {
-  if (!a || a.type !== 'oauth' || a.upstream) return false;
+  if (!a || a.type !== 'oauth' || a.upstream || a.manageRefresh === false) return false;
   return providerOf(a) === 'codex' ? !!a.accountId : !!a.accountUuid;
 }
 
