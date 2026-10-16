@@ -10,7 +10,7 @@ How TeamClaude decides which account serves a request, and what it does when tha
 4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization.
 5. When usage reaches the threshold, the proxy switches to the best available account (see [Choosing an account](#choosing-an-account)).
 6. On 429 responses, the proxy waits the `retry-after` duration and retries; on persistent errors, it switches accounts.
-7. Transient network errors (connection reset, timeout) drop the connection so the client can retry.
+7. Transient network errors (connection reset, timeout) drop the connection so the client can retry — or, with [`TEAMCLAUDE_NETWORK_RETRY_MS`](configuration.md#network-resilience) set, are first retried on the same account for up to that long, as long as nothing has reached the client yet.
 8. If all accounts are exhausted, returns 429 with the soonest reset time — or, with [`holdSeconds`](quota.md#hold-on-exhaustion) set, holds the connection open and retries silently until an account recovers.
 9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently.
 
