@@ -137,6 +137,8 @@ Per-model quota is respected automatically, so most setups need nothing here. To
 - **`bucket`** — optional: force which quota bucket governs eligibility (`unified7dFable`, `unified7dSonnet`, `unified7d`), for the rare case the family can't be inferred from the model id.
 - **`color`** — optional: `red`/`green`/`yellow`/`blue`/`magenta`/`cyan`, tinting this route's inline marker in the TUI. Display only.
 
+A route has no provider setting of its own. Where it is shown — `teamclaude status`, the TUI, the dashboard, `GET /teamclaude/status` — a route whose listed subscription accounts all belong to one provider (a `gpt-*` route naming only Codex logins) is shown as that provider's route: its eligible accounts and its current target are worked out for that provider's requests. Any other route is shown for Claude requests.
+
 Manage routes from the shell (changes apply to a running server immediately):
 
 ```bash

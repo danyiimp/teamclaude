@@ -3535,13 +3535,16 @@ export class AccountManager {
    * entries are fresh objects, never the stored (persisted) route definitions.
    */
   getRoutes() {
-    const out = this.routes.map(r => ({
-      name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
-      provider: DEFAULT_PROVIDER,
-      pinned: this._pinnedName(r.name),
-      accounts: this._routeAccountsView(r, DEFAULT_PROVIDER),
-      target: this._routeTarget(sampleModelFor(r), DEFAULT_PROVIDER),
-    }));
+    const out = this.routes.map(r => {
+      const provider = this._routeProvider(r);
+      return {
+        name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
+        provider,
+        pinned: this._pinnedName(r.name),
+        accounts: this._routeAccountsView(r, provider),
+        target: this._routeTarget(sampleModelFor(r), provider),
+      };
+    });
 
     const detected = [];
     if (this.accounts.some(a => a.quota.unified7dFable != null)) {
@@ -3574,6 +3577,25 @@ export class AccountManager {
   _pinnedName(routeName) {
     const idx = this.routePins.get(routeName);
     return idx == null ? null : (this.accounts[idx]?.name ?? null);
+  }
+
+  /**
+   * The provider whose requests a configured route serves, for the view above.
+   * A route carries no provider of its own, but a subscription account belongs
+   * to exactly one: a route listing only Codex logins is a Codex route, and
+   * judging it as an Anthropic one hides every account it names and previews
+   * a target no request of it will reach. API keys serve either side, so they
+   * say nothing. A route that lists no subscription, or subscriptions of both
+   * providers, reads as the default provider, as before.
+   * @param {{accounts: string[]}} route
+   * @returns {string}
+   */
+  _routeProvider(route) {
+    const providers = new Set(this.accounts
+      .filter(a => isSubscriptionAccount(a)
+        && (route.accounts.includes(a.name) || route.accounts.includes(String(a.index))))
+      .map(a => providerOf(a)));
+    return providers.size === 1 ? [...providers][0] : DEFAULT_PROVIDER;
   }
 
   /** Accounts a configured route can use (all accounts when it lists none), each
