@@ -10,17 +10,35 @@
 // the `account_uuid` field and overwrite its 36-char value with the new UUID
 // (same length → no content-length/flow-control changes). A stray `account_uuid`
 // elsewhere in the body (user content, tool results) is never touched.
+//
+// The same machine patches `device_id`, the other identity field in there: the
+// 64-hex id of the Claude Code install that sent the request. It is only
+// rewritten when the operator configured one for the serving account
+// (`accounts[].deviceId`), for a setup that runs each account under its own
+// Claude Code profile and resumes one conversation under another's.
 
-// Byte sequence of `account_uuid":"` as it appears INSIDE the (escaped) user_id
-// string: account_uuid \ " : \ "
-const PREFIX = Buffer.from('account_uuid\\":\\"', 'latin1');
+// Byte sequence of `<field>":"` as it appears INSIDE the (escaped) user_id
+// string: field \ " : \ "
+/** @param {string} field */
+const escapedKey = (field) => Buffer.from(`${field}\\":\\"`, 'latin1');
 
-export class AccountUuidPatcher {
+export class UserIdFieldPatcher {
   /**
-   * @param {unknown} newUuid  a 36-character account uuid; anything else disables the patcher
+   * @param {string} field  key inside metadata.user_id
+   * @param {unknown} newValue  replacement of exactly `length` characters; anything else disables the patcher
+   * @param {number} length
    */
-  constructor(newUuid) {
-    this.newUuid = (typeof newUuid === 'string' && newUuid.length === 36) ? Buffer.from(newUuid, 'latin1') : null;
+  constructor(field, newValue, length) {
+    this.prefix = escapedKey(field);
+    // KMP fallback table: `device_id` repeats its first byte, so a failed
+    // partial match may already hold the start of the real one.
+    this.fallback = new Uint8Array(this.prefix.length);
+    for (let i = 1, k = 0; i < this.prefix.length; i++) {
+      while (k > 0 && this.prefix[i] !== this.prefix[k]) k = this.fallback[k - 1];
+      if (this.prefix[i] === this.prefix[k]) k++;
+      this.fallback[i] = k;
+    }
+    this.newValue = (typeof newValue === 'string' && newValue.length === length) ? Buffer.from(newValue, 'latin1') : null;
     /** @type {Array<{ container: 'obj'|'arr', name: string|null, key: string|null, awaitingKey: boolean }>} */
     this.frames = [];          // container stack
     this.inStr = false;
@@ -29,9 +47,9 @@ export class AccountUuidPatcher {
     /** @type {number[]} */
     this.keyBuf = [];
     this.target = false;       // inside the metadata.user_id string value
-    this.matchPos = 0;         // PREFIX match progress (within target)
-    this.uuidRemaining = 0;    // value bytes left to overwrite
-    this.done = false;         // patched the one account_uuid already
+    this.matchPos = 0;         // prefix match progress (within target)
+    this.valueRemaining = 0;   // value bytes left to overwrite
+    this.done = false;         // patched the one field already
     this.changed = false;
   }
 
@@ -41,7 +59,7 @@ export class AccountUuidPatcher {
    * @param {Buffer|Uint8Array} chunk
    */
   push(chunk) {
-    if (!this.newUuid || this.done) return chunk;
+    if (!this.newValue || this.done) return chunk;
     const out = Buffer.from(chunk);
     for (let i = 0; i < out.length; i++) {
       out[i] = this.#byte(out[i]);
@@ -83,7 +101,7 @@ export class AccountUuidPatcher {
         } else {
           this.inStr = true; this.esc = false; this.readingKey = false;
           if (top && top.container === 'obj' && top.name === 'metadata' && top.key === 'user_id' && this.frames.length === 2) {
-            this.target = true; this.matchPos = 0; this.uuidRemaining = 0;
+            this.target = true; this.matchPos = 0; this.valueRemaining = 0;
           }
         }
         break;
@@ -92,19 +110,19 @@ export class AccountUuidPatcher {
     return b;
   }
 
-  // Inside the metadata.user_id string value: stream-match the account_uuid key
-  // and overwrite its 36-byte value. Detect the (unescaped) closing quote to exit.
+  // Inside the metadata.user_id string value: stream-match the field's key
+  // and overwrite its value. Detect the (unescaped) closing quote to exit.
   /**
    * @param {number} b
    */
   #targetByte(b) {
-    if (this.uuidRemaining > 0) {
-      // `push` returns before any byte reaches here while `newUuid` is null.
-      const uuid = /** @type {Buffer} */ (this.newUuid);
-      const outByte = uuid[uuid.length - this.uuidRemaining];
-      this.uuidRemaining--;
+    if (this.valueRemaining > 0) {
+      // `push` returns before any byte reaches here while `newValue` is null.
+      const value = /** @type {Buffer} */ (this.newValue);
+      const outByte = value[value.length - this.valueRemaining];
+      this.valueRemaining--;
       if (outByte !== b) this.changed = true;
-      if (this.uuidRemaining === 0) this.done = true; // only one account_uuid per body
+      if (this.valueRemaining === 0) this.done = true; // only one occurrence per body
       return outByte;
     }
     if (this.esc) { this.esc = false; this.#match(b); return b; }
@@ -118,12 +136,33 @@ export class AccountUuidPatcher {
    * @param {number} b
    */
   #match(b) {
-    if (b === PREFIX[this.matchPos]) {
-      this.matchPos++;
-      if (this.matchPos === PREFIX.length) { this.uuidRemaining = 36; this.matchPos = 0; }
-    } else {
-      this.matchPos = (b === PREFIX[0]) ? 1 : 0; // PREFIX has no internal repeat of its first byte
-    }
+    const prefix = this.prefix;
+    let m = this.matchPos;
+    while (m > 0 && b !== prefix[m]) m = this.fallback[m - 1];
+    if (b === prefix[m]) m++;
+    if (m === prefix.length) { this.valueRemaining = /** @type {Buffer} */ (this.newValue).length; m = 0; }
+    this.matchPos = m;
+  }
+}
+
+export class AccountUuidPatcher extends UserIdFieldPatcher {
+  /**
+   * @param {unknown} newUuid  a 36-character account uuid; anything else disables the patcher
+   */
+  constructor(newUuid) {
+    super('account_uuid', newUuid, 36);
+  }
+}
+
+/**
+ * The device id Claude Code sends is the 64-hex `userID` of its own install.
+ */
+export class DeviceIdPatcher extends UserIdFieldPatcher {
+  /**
+   * @param {unknown} newDeviceId  64 lowercase hex characters; anything else disables the patcher
+   */
+  constructor(newDeviceId) {
+    super('device_id', typeof newDeviceId === 'string' && /^[0-9a-f]{64}$/.test(newDeviceId) ? newDeviceId : null, 64);
   }
 }
 
@@ -134,7 +173,24 @@ export class AccountUuidPatcher {
  * @param {unknown} newUuid
  */
 export function patchAccountUuid(buf, newUuid) {
-  const p = new AccountUuidPatcher(newUuid);
+  return patchWith(new AccountUuidPatcher(newUuid), buf);
+}
+
+/**
+ * Same as patchAccountUuid, for `device_id`.
+ *
+ * @param {Buffer} buf
+ * @param {unknown} newDeviceId
+ */
+export function patchDeviceId(buf, newDeviceId) {
+  return patchWith(new DeviceIdPatcher(newDeviceId), buf);
+}
+
+/**
+ * @param {UserIdFieldPatcher} p
+ * @param {Buffer} buf
+ */
+function patchWith(p, buf) {
   const out = p.push(buf);
   return p.changed ? out : buf;
 }

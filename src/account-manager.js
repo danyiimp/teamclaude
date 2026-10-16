@@ -344,6 +344,9 @@ function makeAccount(acct, index, listener = null) {
     accountId: acct.accountId || null,
     userId: acct.userId || null,
     accountUuid: acct.accountUuid || null,
+    // Claude Code install id to put in metadata.user_id.device_id when this
+    // account serves; operator-set, never learned. See account-uuid-rewrite.js.
+    deviceId: acct.deviceId || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
     organizationType: acct.organizationType || null,

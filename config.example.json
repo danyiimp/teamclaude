@@ -41,6 +41,7 @@
       "name": "user@example.com (Acme)",
       "type": "oauth",
       "accountUuid": "optional-account-uuid",
+      "deviceId": "optional-64-hex-claude-code-device-id",
       "orgUuid": "optional-organization-uuid",
       "orgName": "Acme",
       "priority": 0,
