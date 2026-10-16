@@ -34,6 +34,8 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
 
+Which kind a 429 was is decided from its headers, and the log line names the decision, not the evidence. To see the evidence, set `TEAMCLAUDE_DIAG_429=1`: every upstream 429 then also logs one `429 diagnostic` line with the response's headers and body, the request's shape and how the account was reached, and the state of every account at that moment, with e-mail addresses and credentials masked (see [Environment variables](configuration.md#environment-variables)).
+
 ## OAuth entitlement denials
 
 A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.

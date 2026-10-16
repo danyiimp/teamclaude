@@ -1,6 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -2949,6 +2949,112 @@ export async function peekStreamFailure(stream, bounds = {}) {
   };
 }
 
+// Off unless TEAMCLAUDE_DIAG_429=1: one structured line per upstream 429, for
+// telling an account's limit from a refusal of the request when the regular
+// line ("Rate-limit 429 on …") is not enough. See describe429.
+const DIAG_429_BODY_CHARS = 2000;
+const DIAG_429_DROPPED_HEADERS = new Set(['authorization', 'x-api-key', 'cookie', 'set-cookie', 'proxy-authorization']);
+
+/** @returns {boolean} */
+function diag429Enabled() {
+  return envVar('DIAG_429') === '1';
+}
+
+/**
+ * A string as it may appear in a diagnostic line: e-mail addresses become
+ * their first two characters and a short hash (the same address always reads
+ * the same, so lines can be correlated without naming anyone), and anything
+ * shaped like a credential is replaced outright.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function maskDiagnostic(value) {
+  return String(value ?? '')
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
+      e => `${e.slice(0, 2)}…${createHash('sha256').update(e).digest('hex').slice(0, 6)}`)
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, 'sk-***')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer ***')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]+/g, 'jwt-***');
+}
+
+/**
+ * The request body's shape, never its content: the body carries the
+ * conversation.
+ *
+ * @param {Buffer} body
+ */
+function requestShape(body) {
+  try {
+    const j = JSON.parse(body.toString('utf8'));
+    return {
+      model: j.model ?? null, max_tokens: j.max_tokens ?? null, stream: j.stream ?? null,
+      messages: Array.isArray(j.messages) ? j.messages.length : null, keys: Object.keys(j),
+    };
+  } catch { return null; }
+}
+
+/**
+ * One upstream 429, as a single JSON object: what was asked, what came back
+ * (every header but the credential ones, and the body), how this account was
+ * reached, and what every account looked like to selection at that moment.
+ * Account names, header values and the body go through maskDiagnostic; the
+ * request body is reduced to its shape.
+ *
+ * Never throws: a diagnostic that fails says so in its own field and changes
+ * nothing about how the 429 is handled.
+ *
+ * @param {object} o
+ * @param {import('node:http').IncomingMessage} o.req
+ * @param {Buffer} o.body
+ * @param {Record<string, any>} o.ctx
+ * @param {Record<string, any>} o.account
+ * @param {import('./account-manager.js').AccountManager} o.accountManager
+ * @param {{ status: number, headers: Headers }} o.upstreamRes
+ * @param {Buffer|null} o.raw  the response body; null when over the read limit
+ * @param {number} o.retryCount
+ * @param {number|null} o.hopTo
+ * @param {number} o.admittedLoad
+ * @param {boolean} o.requestScoped
+ * @param {string|number} o.reqId
+ */
+function describe429({ req, body, ctx, account, accountManager, upstreamRes, raw, retryCount, hopTo, admittedLoad, requestScoped, reqId }) {
+  try {
+    /** @type {Record<string, string>} */
+    const headers = {};
+    for (const [k, v] of upstreamRes.headers.entries()) if (!DIAG_429_DROPPED_HEADERS.has(k)) headers[k] = maskDiagnostic(v);
+    const text = raw ? raw.toString('utf8') : null;
+    return {
+      req: reqId ?? null,
+      attempt: retryCount,
+      account: maskDiagnostic(account.name),
+      reached_by: hopTo != null ? 'hop' : ctx.pinnedIndex != null ? 'pin' : 'selection',
+      request_scoped: requestScoped,
+      hopped_before: !!ctx.rateLimitHopped,
+      admitted_load: admittedLoad,
+      request: {
+        method: req.method, path: maskDiagnostic(classificationPath(req.url)), provider: ctx.provider ?? null,
+        body_bytes: body?.length ?? null, shape: body?.length ? requestShape(body) : null,
+        beta: maskDiagnostic(req.headers['anthropic-beta']), user_agent: maskDiagnostic(req.headers['user-agent']),
+      },
+      response: {
+        status: upstreamRes.status, retry_after: upstreamRes.headers.get('retry-after'), headers,
+        body_bytes: raw ? raw.length : null, body: text === null ? null : maskDiagnostic(text.slice(0, DIAG_429_BODY_CHARS)),
+      },
+      tried: [...ctx.tried],
+      rolled_off: [...(ctx.rolledOff || [])],
+      accounts: accountManager.accounts.map((/** @type {Record<string, any>} */ a) => ({
+        index: a.index, name: maskDiagnostic(a.name), provider: providerOf(a), priority: a.priority || 0,
+        unavailable: accountManager.unavailableReason(a, ctx.model, ctx.advisorModel),
+        paused: accountManager.isPaused(a.index), in_flight: a.inFlight ?? null,
+        unified: a.quota?.unifiedStatus ?? null,
+      })),
+    };
+  } catch (err) {
+    return { req: reqId ?? null, error: `diagnostic failed: ${safeLine(err instanceof Error ? err.message : String(err), 200)}` };
+  }
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -3402,10 +3508,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const requestScoped = retryAfterHeader == null && Object.keys(rateLimitHeaders).length === 0;
       // The body is diagnostic for a request-scoped refusal (it names the
       // reason) and noise otherwise.
+      // With the 429 diagnostic on, every 429's body is read, since naming the
+      // reason is the point of it.
+      const diag = diag429Enabled();
       let refusal = '';
-      if (requestScoped) {
+      if (requestScoped || diag) {
         const raw = await readErrorBody(upstreamRes.body).catch(() => null);
-        try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
+        if (requestScoped) {
+          try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
+        }
+        if (diag) {
+          console.log(`[TeamClaude] 429 diagnostic ${JSON.stringify(describe429({
+            req, body, ctx, account, accountManager, upstreamRes, raw, retryCount, hopTo, admittedLoad, requestScoped, reqId,
+          }))}`);
+        }
       } else {
         await upstreamRes.body?.cancel();
       }
