@@ -11,6 +11,8 @@
 // (same length → no content-length/flow-control changes). A stray `account_uuid`
 // elsewhere in the body (user content, tool results) is never touched.
 
+import { rootKeyOffset, ROOT_OPEN } from './json-root-key.js';
+
 // Byte sequence of `account_uuid":"` as it appears INSIDE the (escaped) user_id
 // string: account_uuid \ " : \ "
 const PREFIX = Buffer.from('account_uuid\\":\\"', 'latin1');
@@ -135,6 +137,15 @@ export class AccountUuidPatcher {
  */
 export function patchAccountUuid(buf, newUuid) {
   const p = new AccountUuidPatcher(newUuid);
+  // Only the root `metadata` can hold the field, and Claude Code sends it near
+  // the end: patch from there and keep the head as it is (see json-root-key.js).
+  const at = rootKeyOffset(buf, 'metadata');
+  if (at === -1) return buf;
+  if (at !== null) {
+    p.push(ROOT_OPEN);
+    const tail = p.push(buf.subarray(at));
+    return p.changed ? Buffer.concat([buf.subarray(0, at), tail]) : buf;
+  }
   const out = p.push(buf);
   return p.changed ? out : buf;
 }
