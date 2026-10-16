@@ -409,7 +409,11 @@ function makeAccount(acct, index, listener = null) {
     threadRefusalReported: false,
     models: acct.models || null,
     credential: acct.accessToken || acct.apiKey,
-    refreshToken: acct.refreshToken || null,
+    // `manageRefresh: false` hands the token's lifecycle to the client that owns
+    // its file: the proxy holds no refresh token for it, so nothing here rotates
+    // the family under that client (see docs/accounts.md).
+    manageRefresh: acct.manageRefresh !== false,
+    refreshToken: acct.manageRefresh === false ? null : (acct.refreshToken || null),
     expiresAt: acct.expiresAt || null,
     status: 'active',
     // Why the account last went to 'error' (see _needsLogin); read only while
@@ -5155,7 +5159,7 @@ export class AccountManager {
     if (!account || account.type !== 'oauth') return;
 
     account.credential = accessToken;
-    if (refreshToken) account.refreshToken = refreshToken;
+    if (refreshToken && account.manageRefresh) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     // Tokens from elsewhere (the store, a reload from disk) were not minted here.
     account._minted = false;

@@ -1,4 +1,4 @@
-import { importCredentials } from './oauth.js';
+import { credentialFile, importAccountCredentials } from './resolve-accounts.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
@@ -129,6 +129,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // (an API key, a third-party backend, a Codex login) stays opted out on
     // reload as it was at startup; the warning was makeAccount's to give.
     mgr.allowExtraUsage = accountAllowsExtraUsage(diskAcct);
+    // Handing a token back to its owning client applies now: a refresh token
+    // still held would be spent by the next expiry.
+    mgr.manageRefresh = diskAcct.manageRefresh !== false;
+    if (!mgr.manageRefresh) mgr.refreshToken = null;
     // Same for a per-account routing proxy: it is read per request off this
     // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
     // disk edit or a `teamclaude routing` change takes effect on the very next
@@ -174,6 +178,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
+      if (diskAcct.manageRefresh === false) cfgAcct.manageRefresh = false; else delete cfgAcct.manageRefresh;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
       if (diskAcct.maxSpend != null) cfgAcct.maxSpend = diskAcct.maxSpend; else delete cfgAcct.maxSpend;
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
@@ -198,9 +203,13 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // Existing account — resolve fresh credentials from disk
     /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, apiKey?: string }|null} */
     let freshCred = null;
-    if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
+    const from = credentialFile(diskAcct);
+    if (from) {
       try {
-        const creds = await importCredentials(diskAcct.importFrom);
+        // With the reader for the account's provider: the Claude reader finds
+        // no token in a Codex auth.json, so a Codex login read from a file
+        // never picked up a token its own CLI had renewed.
+        const creds = await importAccountCredentials(diskAcct, from);
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Re-import failed for "${safeLine(diskAcct.name, 64)}": ${err.message}`);
@@ -214,8 +223,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (!freshCred) continue;
 
     if (freshCred.accessToken) {
+      // An account that does not manage its refresh holds none, whatever the
+      // file carries, so only the access token can differ.
       const changed = mgr.credential !== freshCred.accessToken ||
-        mgr.refreshToken !== freshCred.refreshToken;
+        (mgr.manageRefresh && mgr.refreshToken !== (freshCred.refreshToken ?? null));
       // Don't overwrite in-memory credentials with staler ones from disk
       // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
       const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&

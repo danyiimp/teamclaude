@@ -51,7 +51,20 @@ Instead of storing an OAuth account's tokens in `teamclaude.json`, an account en
 { "name": "me@example.com", "type": "oauth", "importFrom": "~/.claude/.credentials.json" }
 ```
 
-The tokens (`accessToken`, `refreshToken`, `expiresAt`) are read from that file at startup and again on every config reload, so a login refreshed by Claude Code itself is picked up without re-running `teamclaude import`. A 401 on an account whose file holds no refresh token also re-reads it, and waits briefly for a rotated token (see [When the key is rejected](#when-the-key-is-rejected-401)). Every other field on the entry (`priority`, `disabled`, `upstream`, `modelMap`, …) is kept as written. A file with no token skips the account with a message rather than sending an empty credential upstream. `teamclaude import` is the alternative: it copies the tokens into the config once.
+The tokens (`accessToken`, `refreshToken`, `expiresAt`) are read from that file at startup and again on every config reload, so a login refreshed by Claude Code itself is picked up without re-running `teamclaude import`. A Codex entry reads its file with the Codex reader on reload as well as at startup. A 401 on an account whose file holds no refresh token also re-reads it, and waits briefly for a rotated token (see [When the key is rejected](#when-the-key-is-rejected-401)). Every other field on the entry (`priority`, `disabled`, `upstream`, `modelMap`, …) is kept as written. A file with no token skips the account with a message rather than sending an empty credential upstream. `teamclaude import` is the alternative: it copies the tokens into the config once.
+
+### Leaving the refresh to the client that owns the file (`manageRefresh`)
+
+Refresh tokens rotate: each refresh returns a new one and retires the one it was made with. When the proxy and the client that wrote the file — Claude Code, the Codex CLI — both hold the same refresh token, whichever refreshes first leaves the other holding a dead one. The client then asks you to log in again, or the proxy's account goes into error, depending on who lost the race. That happens whenever you keep using a login directly while it is also pooled through `importFrom` (or a Codex entry's default `~/.codex/auth.json`).
+
+Set `"manageRefresh": false` on such an entry to leave the token to its owner:
+
+```json
+{ "name": "second", "type": "oauth", "provider": "codex",
+  "importFrom": "~/.codex-second/auth.json", "manageRefresh": false }
+```
+
+The proxy then reads only the access token from the file, at startup and on every reload, and holds no refresh token for the account: it never refreshes it, never writes its token into `teamclaude.json`, and leaves it out of [credential sync](#syncing-accounts-across-machines-callbacknet). When the access token expires, upstream answers 401, the request fails over, and the account leaves rotation as one with no refresh token does (status shows it as needing a re-login). A reload that reads a token the client has renewed brings it straight back. So the account serves for as long as its owning client keeps the file fresh and the proxy is reloaded after it does (`POST /teamclaude/reload`, `R` in the TUI). Applied live on reload: turning it off hands the refresh back to the proxy on the next read of the file.
 
 ## API key
 
