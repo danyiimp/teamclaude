@@ -1679,7 +1679,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // this is, and a Codex Responses body carries `input`/`instructions` and
       // no `messages`, so the walk could only ever come back empty-handed — after
       // reading as far into a multi-megabyte body as its bound allows.
-      const provider = providerForPath(req.url);
+      const provider = providerForPath(req.url, model);
       const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
         ? placeConversation(accountManager, body, sessionId)
         : { conversation: null, pinKey: pinKeyFor(sessionId, null), onMessage: null };
@@ -4891,10 +4891,13 @@ export function rewriteModel(body, modelMap) {
     // Own keys only: the map is a plain object, so a model named
     // "constructor" or "toString" would otherwise look up a prototype
     // function, which JSON.stringify then drops — the request goes upstream
-    // with no model at all.
-    if (typeof obj.model === 'string' && Object.hasOwn(modelMap, obj.model) && typeof modelMap[obj.model] === 'string') {
-      obj.model = modelMap[obj.model];
-      return Buffer.from(JSON.stringify(obj), 'utf8');
+    // with no model at all. A `"*"` key maps every model the map does not name.
+    if (typeof obj.model === 'string') {
+      const mapped = Object.hasOwn(modelMap, obj.model) ? modelMap[obj.model] : modelMap['*'];
+      if (typeof mapped === 'string') {
+        obj.model = mapped;
+        return Buffer.from(JSON.stringify(obj), 'utf8');
+      }
     }
   } catch { /* not JSON — pass through unchanged */ }
   return body;

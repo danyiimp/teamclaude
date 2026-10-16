@@ -14,6 +14,7 @@
 // exactly the fidelity loss this proxy exists to avoid.
 
 import { classificationPath } from './classification-path.js';
+import { envVar } from './brand.js';
 
 /** Providers keyed by the value used in an account's `provider` field. */
 export const PROVIDERS = {
@@ -27,6 +28,18 @@ export const PROVIDERS = {
     // No provider opinion on the header wait: a streamed completion delivers
     // its first token in seconds, so the fleet default already fits.
     headersTimeoutMs: null,
+  },
+  // Zhipu's GLM behind its Anthropic-compatible endpoint: the client speaks the
+  // Messages API unchanged and an API key authenticates it, so this is the same
+  // passthrough as Anthropic minus the Anthropic-only body rewrites.
+  glm: {
+    id: 'glm',
+    label: 'GLM',
+    upstream: 'https://open.bigmodel.cn/api/anthropic',
+    rewritesBody: false,
+    // A GLM reasoning turn holds the response head open the way the ChatGPT
+    // backend does (see codex below), and for longer on a large context.
+    headersTimeoutMs: 600_000,
   },
   codex: {
     id: 'codex',
@@ -107,7 +120,11 @@ export function canServeProvider(account, provider) {
 // honours HTTPS_PROXY has no base-URL to redirect, so if the proxy will not
 // intercept the provider's host, that provider is simply unreachable through
 // it. Codex is exactly that case.
-const PROVIDER_HOSTS = { 'api.anthropic.com': 'anthropic', 'chatgpt.com': 'codex' };
+const PROVIDER_HOSTS = {
+  'api.anthropic.com': 'anthropic',
+  'open.bigmodel.cn': 'glm',
+  'chatgpt.com': 'codex',
+};
 
 // Hosts adjacent to a provider that must NOT be intercepted.
 //
@@ -162,6 +179,9 @@ export function isKnownProvider(id) {
 // and it keeps the Codex namespace clearly separated from Anthropic's `/v1/*`.
 const CODEX_PATHS = ['/backend-api/codex'];
 
+const GLM_MODEL = /^glm(?:-|$)/i;
+const CLAUDE_MODEL = /^claude(?:-|$)/i;
+
 /**
  * Which provider should serve a request path.
  *
@@ -169,8 +189,18 @@ const CODEX_PATHS = ['/backend-api/codex'];
  * `/v1/messages` and Codex to `/backend-api/codex/responses`, so the path alone
  * says which pool of accounts is eligible. No second listener, no
  * client-supplied hint that could disagree with the body.
+ *
+ * The one exception is the model: a `glm-*` model can only be served by a GLM
+ * account, so it selects the GLM pool whatever path it arrived on. With
+ * TEAMCLAUDE_ALL_ANTHROPIC_TO_GLM=1 every `claude-*` model goes there too — a
+ * switch for moving a whole fleet onto GLM without touching the clients, whose
+ * model ids the GLM account's `modelMap` (a `"*"` key included) translates.
  */
-export function providerForPath(url) {
+export function providerForPath(url, model = null) {
+  if (typeof model === 'string') {
+    if (GLM_MODEL.test(model)) return 'glm';
+    if (envVar('ALL_ANTHROPIC_TO_GLM') === '1' && CLAUDE_MODEL.test(model)) return 'glm';
+  }
   // Read on the classification path, never rewritten: the request goes out with
   // the path exactly as it arrived, so this test has to read it the way the
   // parser and the receiving server will. Otherwise
@@ -191,7 +221,7 @@ export function providerForPath(url) {
  * them. Returns nothing: the caller owns the object.
  *
  * - Anthropic OAuth and Codex both use `Authorization: Bearer`.
- * - Anthropic API keys use `x-api-key`.
+ * - Anthropic API keys and GLM use `x-api-key`.
  * - Codex additionally needs `ChatGPT-Account-Id`, which is how OpenAI scopes
  *   a token to one ChatGPT account. It is the direct counterpart of the
  *   `account_uuid` that the Anthropic path patches into the request body —
@@ -199,6 +229,10 @@ export function providerForPath(url) {
  */
 export function applyAuthHeaders(headers, account) {
   const provider = providerOf(account);
+  if (provider === 'glm') {
+    headers['x-api-key'] = account.credential;
+    return;
+  }
   if (provider === 'codex') {
     headers['authorization'] = `Bearer ${account.credential}`;
     if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
