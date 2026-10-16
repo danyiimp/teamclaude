@@ -28,3 +28,19 @@ Upstream already serves GLM as a [third-party backend](accounts.md#third-party-b
 Anthropic-compatible gateways substitute a different model when the requested one is unavailable; the header asks
 those that support it to refuse instead, so a session never runs on a model it did not ask for. Gateways that do not
 know the header ignore it. A config reload applies an edit live.
+
+## Provider-bound API keys
+
+Upstream keeps an API-key account eligible for every provider's requests: only subscriptions are partitioned. Here an
+API-key account whose entry names a `provider` is bound to it, the way a subscription is — a `"provider": "glm"` key
+never serves a Claude or Codex request, and an `"provider": "anthropic"` key never serves a GLM one. An entry without
+a `provider` stays unbound, as upstream. `accounts[].providerBound` (`true`/`false`) overrides the inference either
+way, and a reload applies it live. The final account check refuses a bound account handed to another provider's
+request with a plain `400` naming the binding, whether it came from a pin, a hop or selection.
+
+With a [fallback tier](routing.md#fallback-tiers) held closed, a request whose preferred accounts all failed for a
+reason other than quota (a refused credential, a transport error that failed over) ends with a `502`
+"No preferred account served this request … Lower fallback tiers remain closed …" instead of a rate-limit `429`, so
+the client and the log say why the last-resort tier was not used. Under `holdSeconds` a transport failure is retried
+by the hold first. The upstream "every account refused the credential" `502` now counts only the accounts that could
+serve the request (provider, route, open tier, not disabled).

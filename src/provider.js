@@ -88,13 +88,41 @@ export function providerOf(account) {
  * accounts are partitioned by provider, strictly.
  *
  * An API key is not. It is metered capacity rather than a seat — nothing about
- * it says which app may spend it — so it stays eligible for any caller. That is
+ * it says which app may spend it — so it stays eligible for any caller, unless
+ * its config binds it to a provider (see isProviderBound). That is
  * what lets a third-party backend (a `upstream` + `modelMap` account) serve
  * whichever app is asking, instead of being fenced off by a provider field it
  * never set.
  */
 export function isSubscriptionAccount(account) {
   return account?.type === 'oauth';
+}
+
+/**
+ * Whether an account's config binds it to its provider: `providerBound` when
+ * set, else whether the entry names a `provider` at all. An entry that says
+ * `"provider": "glm"` is a GLM key, and spending it on a Claude or Codex
+ * request would send that request to the wrong backend.
+ *
+ * Read off the config entry. The live account carries it as `providerBound`,
+ * because makeAccount writes `provider` onto every account.
+ *
+ * @param {Record<string, any>|null|undefined} acct
+ * @returns {boolean}
+ */
+export function accountProviderBound(acct) {
+  return typeof acct?.providerBound === 'boolean' ? acct.providerBound : Object.hasOwn(acct ?? {}, 'provider');
+}
+
+/**
+ * Whether `account` serves only its own provider's requests: every
+ * subscription, and an API key whose config binds it (accountProviderBound).
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {boolean}
+ */
+export function isProviderBound(account) {
+  return isSubscriptionAccount(account) || accountProviderBound(account);
 }
 
 /**
@@ -111,7 +139,7 @@ export function isSubscriptionAccount(account) {
  * @returns {boolean}
  */
 export function canServeProvider(account, provider) {
-  return providerOf(account) === provider || !isSubscriptionAccount(account);
+  return providerOf(account) === provider || !isProviderBound(account);
 }
 
 // The hosts each provider is reached on, for MITM interception.

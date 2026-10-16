@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
-import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
+import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider, accountProviderBound, isProviderBound } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
@@ -338,6 +338,9 @@ function makeAccount(acct, index, listener = null) {
     // Which backend this account talks to. Absent means Anthropic, so configs
     // written before providers existed keep working untouched.
     provider: providerOf(acct),
+    // Whether the account serves only that provider's requests (see
+    // isProviderBound). Kept apart from `provider`, which every account has.
+    providerBound: accountProviderBound(acct),
     // Codex scopes a token to one ChatGPT account via a request header; this is
     // that id. The Anthropic counterpart is `accountUuid`, which is patched
     // into the request body instead.
@@ -3657,7 +3660,7 @@ export class AccountManager {
    */
   _routeProvider(route) {
     const providers = new Set(this.accounts
-      .filter(a => isSubscriptionAccount(a)
+      .filter(a => isProviderBound(a)
         && (route.accounts.includes(a.name) || route.accounts.includes(String(a.index))))
       .map(a => providerOf(a)));
     return providers.size === 1 ? [...providers][0] : DEFAULT_PROVIDER;

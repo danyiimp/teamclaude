@@ -3264,11 +3264,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // A pin bypasses selection entirely, so the provider partition has to be
   // enforced here too — otherwise TC_ACCT aimed at a Claude subscription would
   // serve a Codex request from it, sending an OpenAI-shaped body to
-  // api.anthropic.com with a Claude token. Subscriptions only: an API-key
-  // account is metered capacity with no tie to a caller, so a pin to one stands.
-  const pinnedWrongProvider = pinned
-    && isSubscriptionAccount(pinned)
-    && providerOf(pinned) !== (ctx.provider || DEFAULT_PROVIDER);
+  // api.anthropic.com with a Claude token. Subscriptions and provider-bound
+  // API keys only: an unbound API-key account is metered capacity with no tie
+  // to a caller, so a pin to one stands.
+  const requestProvider = ctx.provider || DEFAULT_PROVIDER;
+  const pinnedWrongProvider = pinned && !canServeProvider(pinned, requestProvider);
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
@@ -3285,7 +3285,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ctx.rolledOff ??= new Set();
     for (const i of selection.rolledOff) ctx.rolledOff.add(i);
   }
-  if (pinnedWrongProvider && !res.headersSent && !clientGone(res)) {
+  // Selection already leaves other providers' accounts out; this is the
+  // guarantee behind it, so a bound account is refused at the last step even if
+  // a pin, a hop or a future selection path ever hands one over.
+  const wrongProvider = pinnedWrongProvider ? pinned
+    : account && !canServeProvider(account, requestProvider) ? account : null;
+  if (wrongProvider && !res.headersSent && !clientGone(res)) {
     // Named plainly: a pin that cannot serve is a configuration mistake, and the
     // exhausted-account response would send the operator looking at quota.
     ctx.status = 400;
@@ -3295,7 +3300,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       type: 'error',
       error: {
         type: 'invalid_request_error',
-        message: `Pinned account "${pinned.name}" is a ${providerOf(pinned)} subscription and cannot serve a ${ctx.provider} request.`,
+        message: wrongProvider === pinned && isSubscriptionAccount(pinned)
+          ? `Pinned account "${pinned.name}" is a ${providerOf(pinned)} subscription and cannot serve a ${ctx.provider} request.`
+          : `Account "${wrongProvider.name}" is bound to ${providerOf(wrongProvider)} and cannot serve a ${requestProvider} request.`,
       },
     }));
     return;
@@ -3312,25 +3319,45 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // failing fast on the strength of one bad credential. Reporting 502 there
     // would turn a recoverable exhaustion into a hard error, and silently skip
     // the holdSeconds wait an unattended run depends on.
-    const rejected = ctx.credentialRejected;
-    const allRefused = rejected?.size > 0 && (ctx.pinnedIndex != null
-      ? rejected.has(accountManager.accounts[ctx.pinnedIndex]?.name)
-      : rejected.size === accountManager.accounts.length);
-    if (allRefused) {
-      const names = [...rejected].map(n => `"${n}"`).join(', ');
+    //
+    // The whole story is the accounts this request could be served by: its
+    // provider, its model's route, and the open fallback tier. While a higher
+    // tier is held closed, an account there was never a candidate, so it
+    // cannot keep the refusals from being the whole story. And with a tier
+    // held closed a transport failure counts too, unless a hold will retry it:
+    // the last-resort tier opens only on quota exhaustion, so the honest answer
+    // is that the preferred accounts failed, not a rate limit.
+    const rejected = ctx.credentialRejected ?? new Set();
+    const transientFailed = ctx.transientFailed ?? new Set();
+    const heldTiers = accountManager._excludeClosedTiers(null, requestProvider, ctx.model);
+    const preferred = ctx.pinnedIndex != null
+      ? [accountManager.accounts[ctx.pinnedIndex]].filter(Boolean)
+      : candidateAccounts(accountManager, ctx.model, ctx.provider)
+        .filter((/** @type {Record<string, any>} */ a) => !a.disabled && !heldTiers?.has(a.index));
+    const transientCounts = ctx.pinnedIndex == null && heldTiers != null && !(ctx.holdBudgetMs > 0);
+    const failed = (/** @type {Record<string, any>} */ a) => rejected.has(a.name)
+      || (transientCounts && transientFailed.has(a.name));
+    if (preferred.length > 0 && preferred.every(failed)) {
+      const failedNames = preferred.map(a => a.name);
+      const names = failedNames.map(n => `"${n}"`).join(', ');
+      const allRefused = failedNames.every(name => rejected.has(name));
       const entitlementDenied = ctx.entitlementDenied;
-      const allEntitlementDenied = entitlementDenied?.size === rejected.size
-        && [...rejected].every(name => entitlementDenied.has(name));
+      const allEntitlementDenied = failedNames.every(name => entitlementDenied?.has(name));
+      const tierNote = heldTiers ? ' Lower fallback tiers remain closed because this is not quota exhaustion.' : '';
       let message;
       if (allEntitlementDenied && ctx.pinnedIndex != null) {
         message = `No account served this request. The pinned account ${names} returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}). An explicit pin targets that account exactly; choose a different eligible account or change its organization's OAuth policy.`;
+      } else if (allEntitlementDenied && heldTiers) {
+        message = `No preferred account served this request. OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}.${tierNote}`;
       } else if (allEntitlementDenied) {
         message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
+      } else if (allRefused) {
+        message = `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login${tierNote ? `.${tierNote}` : ''}`;
       } else {
-        message = `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login`;
+        message = `No preferred account served this request: ${names}. Lower fallback tiers remain closed because the failure was not quota exhaustion.`;
       }
       ctx.status = 502;
-      ctx.account = `(${[...rejected].join(', ')} refused)`;
+      ctx.account = `(${failedNames.join(', ')} ${allRefused ? 'refused' : 'failed'})`;
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -4363,6 +4390,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // a healthy account from rotation until a credential change). Instead skip
     // it for the rest of THIS request only and fail over to another account.
     if (retryCount < maxRetries && !res.headersSent) {
+      (ctx.transientFailed ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
