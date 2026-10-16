@@ -18,6 +18,14 @@ import { fetchCodexUsage } from './codex-usage.js';
 // seconds, so the ceiling lives here where the timer is armed.
 export const MAX_PROBE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// With `quotaProbeOnlyWhenStale`, an account whose quota headers are younger
+// than this is serving traffic, so the proxy already holds its numbers; and a
+// 429 from the usage endpoint keeps that account's probe quiet this long. The
+// endpoint is rate-limited per access token, and asking again while limited
+// only keeps it limited.
+export const PROBE_HEADERS_FRESH_MS = 15 * 60 * 1000;
+export const PROBE_RATE_LIMIT_BACKOFF_MS = 60 * 60 * 1000;
+
 function clampInterval(ms) {
   return ms > 0 ? Math.min(ms, MAX_PROBE_INTERVAL_MS) : 0;
 }
@@ -52,7 +60,7 @@ export class Prober {
   // notices below are produced later still, by a reload that changes the probe
   // interval, so a captured `console.log` would put them on a terminal the
   // alternate screen has already covered.
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, onlyWhenStale = false, log = (/** @type {string} */ line) => console.log(line) } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
@@ -60,6 +68,7 @@ export class Prober {
     this.profileFn = profileFn;
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
+    this.onlyWhenStale = onlyWhenStale;
     this.log = log;
     this.timer = null;
     this._running = false;
@@ -99,15 +108,20 @@ export class Prober {
     this.nextRunAt = null;
   }
 
-  /** Probe every OAuth account once. Overlapping cycles are skipped. */
-  async probeAll() {
+  /**
+   * Probe every OAuth account once. Overlapping cycles are skipped. `manual`
+   * marks an operator's one-shot refresh: it skips the stale-only schedule
+   * (that is how a reset made outside the proxy is picked up) but not the 429
+   * backoff.
+   */
+  async probeAll({ manual = false } = {}) {
     if (this._running) return;
     this._running = true;
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
       const accounts = this.am.accounts.filter(account =>
-        this._probeable(account) && (this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account)));
+        this._probeable(account) && this._due(account, manual) && (this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account)));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -154,6 +168,30 @@ export class Prober {
     return true;
   }
 
+  /**
+   * Whether an Anthropic account's usage is worth reading now. Always, unless
+   * `quotaProbeOnlyWhenStale` is on; then only when its numbers can have moved
+   * without the proxy seeing it: a bucket is unknown, or a known window reset
+   * has passed since the numbers were last learned. An account with a money
+   * cap is exempt from that schedule, since the spend figure it is judged
+   * against moves with traffic and only the probe reads it.
+   * @param {Record<string, any>} account
+   * @param {boolean} manual
+   */
+  _due(account, manual) {
+    if (!this.onlyWhenStale || !this._isProbeTarget(account)) return true;
+    const now = Date.now();
+    const last = this.accountStatus.get(account.name);
+    if (last?.httpStatus === 429 && now - last.finishedAt < PROBE_RATE_LIMIT_BACKOFF_MS) return false;
+    if (manual || account.maxSpend != null) return true;
+    const q = account.quota;
+    if (q.unifiedStatusSeenAt && now - q.unifiedStatusSeenAt < PROBE_HEADERS_FRESH_MS) return false;
+    if (q.unified5h == null || q.unified7d == null) return true;
+    const learnedAt = Math.max(last?.status === 'ok' ? last.finishedAt : 0, q.unifiedStatusSeenAt || 0);
+    return [q.unified5hReset, q.unified7dReset, q.unified7dSonnetReset, q.unified7dFableReset]
+      .some(reset => reset && reset <= now && reset > learnedAt);
+  }
+
   async probeAccount(account) {
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
@@ -175,6 +213,7 @@ export class Prober {
         this._recordAccount(account, {
           status: usage?.error ? 'error' : 'timeout',
           error: usage?.error || 'probe timed out',
+          httpStatus: usage?.status ?? null,
           startedAt,
           finishedAt,
           durationMs: finishedAt - startedAt,
@@ -193,6 +232,7 @@ export class Prober {
       this._recordAccount(account, {
         status: 'ok',
         error: null,
+        httpStatus: null,
         startedAt,
         finishedAt,
         durationMs: finishedAt - startedAt,
@@ -202,6 +242,7 @@ export class Prober {
       this._recordAccount(account, {
         status: 'error',
         error: err?.message || String(err),
+        httpStatus: null,
         startedAt,
         finishedAt,
         durationMs: finishedAt - startedAt,

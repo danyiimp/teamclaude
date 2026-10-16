@@ -20,6 +20,7 @@
   "distributeSessions": false,
   "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
+  "quotaProbeOnlyWhenStale": false,
   "autoUpdate": true,
   "autoRedeemResets": false,
   "expiryRouting": {

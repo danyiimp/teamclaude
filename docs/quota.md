@@ -40,6 +40,17 @@ The probe is also the only source for the **Sonnet 7-day** bucket, when your pla
 
 It is likewise the only source for Claude's [banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets), read from the same call.
 
+### Probing only when the numbers can have moved
+
+Anthropic rate-limits `/api/oauth/usage` per access token: a handful of calls in a short time and it answers 429, and asking again while limited keeps it limited. With many accounts and a short interval the timed probe reaches that limit itself. `quotaProbeOnlyWhenStale: true` makes the timed probe read an Anthropic account only when its numbers can have changed without the proxy seeing them:
+
+- a bucket is unknown (no session or weekly reading yet), or
+- a known window reset (session, weekly, Sonnet or Fable weekly) has passed since the numbers were last learned, from a probe or from response headers.
+
+It also leaves alone an account whose response headers are under 15 minutes old (it is serving traffic, so the proxy is already current), and any account whose last probe got a 429 within the hour. A manual refresh — `p` in the TUI, the dashboard button, `POST /teamclaude/probe`, the MCP tool — ignores the schedule, which is how a reset made outside the proxy is picked up, but still waits out the 429 backoff. An account with `maxSpend` keeps the full schedule, since its spend figure only comes from the probe.
+
+The trade-off: with the switch on, spend from outside the proxy on an idle account, a newly banked reset and a changed spend figure on an account without `maxSpend` are seen at the next window reset or manual refresh, not within one interval. Codex and backend accounts are not affected. Off by default.
+
 ### Revalidating a spent family bucket
 
 Those `7d_oi` headers ride on **Fable responses only** — no other model's response carries them. That makes a spent Fable (or Sonnet) reading self-sealing: once it reads at or above the switch threshold, rotation stops sending that family to the account, which is also the only thing that could have refreshed the reading ([#167](https://github.com/KarpelesLab/teamclaude/issues/167)).

@@ -636,6 +636,8 @@ async function serverCommand() {
       else { sx.disable(); await sx.setMode(diskSxMode); }
     }
     if (prober) {
+      config.quotaProbeOnlyWhenStale = diskConfig.quotaProbeOnlyWhenStale === true;
+      prober.onlyWhenStale = config.quotaProbeOnlyWhenStale;
       const ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
       if (ms !== prober.intervalMs) {
         config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
@@ -754,7 +756,7 @@ async function serverCommand() {
       },
       // `p` key: on-demand fleet-wide quota refresh. The prober is constructed
       // after the TUI, so this is a thunk over the closure variable.
-      probeQuota: () => prober?.probeAll(),
+      probeQuota: () => prober?.probeAll({ manual: true }),
       // ctrl-c / q from the TUI: funnel through the same idempotent shutdown as
       // POSIX signals (defined below). In raw mode ctrl-c never reaches the OS as
       // a signal, so without this the process would only tear down via keypress.
@@ -969,12 +971,13 @@ async function serverCommand() {
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
   prober = new Prober(accountManager, {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
+    onlyWhenStale: config.quotaProbeOnlyWhenStale === true,
     profileFn: fetchProfile,
   });
   // The web dashboard's one-shot probe button uses the same zero-spend action
   // as the TUI's `p` key. Assigned after construction because the hook object
   // is already shared with the server created above.
-  hooks.probeQuota = () => prober?.probeAll();
+  hooks.probeQuota = () => prober?.probeAll({ manual: true });
   prober.start();
   // A money cap (accounts[].maxSpend) is judged against the month-to-date
   // figure only the probe refreshes — a response carries none — so with the
