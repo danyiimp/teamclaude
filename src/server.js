@@ -108,6 +108,28 @@ function resolveHeaderless429RetryDelayMs() {
   if (env === 0) return 0;
   return env > 0 ? env : DEFAULT_HEADERLESS_429_RETRY_DELAY_MS;
 }
+// How long a request keeps retrying a network failure on the same account, in
+// ms, before the connection is closed for the client to retry instead. Off (0)
+// unless TEAMCLAUDE_NETWORK_RETRY_MS is set.
+//
+// A transient failure that happens before any response byte (a reset, a refused
+// or timed-out connect, a stalled tunnel) says nothing about the account: every
+// account dials the same host, through the same network. Closing at once is
+// right for a single poisoned socket, which the client's retry replaces. It is
+// wrong for an outage of tens of seconds, where every retry the client makes
+// lands inside it and the client gives up — a long unattended run then dies over
+// a network blip it would have outlived.
+//
+// The waits follow NETWORK_RETRY_STEPS_MS and the last step repeats until the
+// budget is spent; then the connection is closed as before. The request never
+// fails over for it, and the account is never skipped.
+const NETWORK_RETRY_STEPS_MS = [1000, 2000, 4000, 8000, 15000];
+
+/** @returns {number} */
+function resolveNetworkRetryMs() {
+  const env = Number(envVar('NETWORK_RETRY_MS'));
+  return env > 0 ? env : 0;
+}
 const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 // How long an idle keep-alive connection is held open.
@@ -4135,6 +4157,27 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // fast failure lets Node evict the dead socket so the retry reconnects
     // cleanly. If headers were already sent (a mid-stream body timeout), destroy
     // is the only option — the client sees a broken response and retries.
+    // Retried here, on the same account, when TEAMCLAUDE_NETWORK_RETRY_MS allows
+    // it and nothing has reached the client yet (see resolveNetworkRetryMs).
+    const networkRetryMs = isTransient && !res.headersSent && !clientGone(res) ? resolveNetworkRetryMs() : 0;
+    if (networkRetryMs > 0) {
+      ctx.networkRetries = (ctx.networkRetries || 0) + 1;
+      ctx.networkRetryStart ??= Date.now();
+      const elapsed = Date.now() - ctx.networkRetryStart;
+      if (elapsed < networkRetryMs) {
+        const step = NETWORK_RETRY_STEPS_MS[Math.min(ctx.networkRetries, NETWORK_RETRY_STEPS_MS.length) - 1];
+        const delay = Math.min(step, networkRetryMs - elapsed);
+        console.log(`[TeamClaude] Network error on "${safeLine(account.name, 64)}" (${describeConnectError(err)}) — retry ${ctx.networkRetries} on the same account in ${Math.ceil(delay / 1000)}s`);
+        await waitForRetry(delay, ctx.signal);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        // The same account when it can still serve; if it cannot (its quota ran
+        // out meanwhile, it was disabled), selection picks as it would anyway.
+        if (accountManager._isAvailable(account, ctx.model)) ctx.hopTo = account.index;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      }
+      console.error(`[TeamClaude] Network still failing after ${Math.round(elapsed / 1000)}s on "${safeLine(account.name, 64)}" — closing the connection for the client to retry`);
+    }
+
     if (isTransient) {
       ctx.proxyClosed = true;
       res.destroy();
