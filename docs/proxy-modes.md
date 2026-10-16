@@ -78,6 +78,15 @@ restart.
 - **TLS stays end-to-end.** The tunnel is a plain `CONNECT`; the proxy sees
   ciphertext only, and certificate verification is unchanged. A proxy that
   intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.
+- **A stalled proxy is a network failure, not an account's.** Opening a tunnel
+  — the `CONNECT`, then the TLS handshake through it — may take 30 s each by
+  default. A tunnel that does not open in time closes the client's connection
+  for it to retry, the same as a socket timeout on a direct route; it does not
+  skip the account, since every account dials through the same proxy. For a
+  proxy that normally answers in well under a second, a shorter
+  `TEAMCLAUDE_TUNNEL_TIMEOUT_MS` (see
+  [Network resilience](configuration.md#network-resilience)) gets that retry
+  going sooner.
 - SOCKS URLs are refused here (`http` `CONNECT` only), as is `https://` to the
   proxy itself: TeamClaude does not speak TLS *to* the proxy, and accepting the
   scheme would send the `CONNECT` (credentials included) in plaintext to port
