@@ -334,3 +334,21 @@ Set it in the config file (`~/.config/teamclaude.json`):
 `teamclaude run` automatically raises `API_TIMEOUT_MS` on the spawned Claude Code process to `holdSeconds + 60` seconds, so the client-side timeout covers the full hold window. No manual Claude Code configuration is needed.
 
 Useful for overnight or unattended runs: rather than waking up to a stopped task, the session resumes silently once a quota window opens.
+
+Each poll starts the request over: an account it already tried — refused for quota, say, before the hold began — is tried again once selection lets it, so a window that resets, on time or early, is picked up by the request that was waiting for it. Only an account that refused the credential stays excluded.
+
+### Keeping a held stream alive
+
+A hold is silent until an account recovers, and Claude Code does not wait on silence indefinitely. Beside `API_TIMEOUT_MS`, which `teamclaude run` raises, it gives up on a streaming request whose first byte is late or whose stream goes idle, and retries; once its retries run out the turn fails, and an unattended run stops inside the hold that was meant to carry it. Clients not launched by `teamclaude run` do not get `API_TIMEOUT_MS` raised at all.
+
+```json
+"holdSeconds": 3600,
+"holdKeepalive": true
+```
+
+With `holdKeepalive`, a **streaming** request that enters the hold is answered at once — `200`, `content-type: text/event-stream` — and sent `event: ping` every 15 seconds, the same event the upstream uses to keep a stream open, until an account can serve it. Then:
+
+- a successful stream continues on the same connection, as if it had started late. Its own response headers are not sent, since the headers already went out — including the `anthropic-ratelimit-*` ones Claude Code reads for its quota display, for that one request;
+- any other outcome — the hold's budget running out, an upstream error — arrives as one `event: error` carrying the error object the client would otherwise have received with an HTTP status (a `rate_limit_error` for an exhausted fleet).
+
+Off by default, because it changes what the client receives: an HTTP `429` becomes an error inside a `200` stream. Non-streaming requests are held silently as before.
